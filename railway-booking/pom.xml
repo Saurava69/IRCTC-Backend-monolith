@@ -18,5 +18,21 @@
             <groupId>com.railway</groupId>
             <artifactId>railway-common</artifactId>
         </dependency>
+        <dependency>
+            <groupId>com.railway</groupId>
+            <artifactId>railway-user</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-data-redis</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.redisson</groupId>
+            <artifactId>redisson-spring-boot-starter</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-security</artifactId>
+        </dependency>
     </dependencies>
 </project>

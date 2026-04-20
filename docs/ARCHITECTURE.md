@@ -21,8 +21,10 @@
 12. [Configuration Management](#12-configuration-management)
 13. [What Each Module Does](#13-what-each-module-does)
 14. [The Railway Domain - Key Concepts](#14-the-railway-domain---key-concepts)
-15. [What's Coming Next (Phase 2-6)](#15-whats-coming-next)
-16. [File Reference Guide](#16-file-reference-guide)
+15. [Redis & Distributed Systems Patterns (Phase 2)](#15-redis--distributed-systems-patterns-phase-2)
+16. [The Booking Engine — How It All Fits Together](#16-the-booking-engine--how-it-all-fits-together)
+17. [What's Coming Next (Phase 3-6)](#17-whats-coming-next)
+18. [File Reference Guide](#18-file-reference-guide)
 
 ---
 
@@ -759,9 +761,42 @@ Database connections are expensive to create (~50-100ms). A connection pool main
 | `TrainController.java` | `GET /trains` (list), `GET /trains/{number}`, `POST /admin/trains` |
 | `RouteController.java` | `GET /routes/{id}`, `POST /admin/routes`, `POST /admin/schedules` |
 
-### railway-booking, railway-payment, railway-notification
+### railway-booking
 
-**Purpose**: Stubs for now. Each has only a `@Configuration` class so Maven can build them. Real implementation comes in Phases 2-5.
+**Purpose**: The heart of the system. Handles seat availability checking, distributed seat locking, booking creation, PNR status lookup, train run materialization, rate limiting, and idempotency.
+
+| File | What it does |
+|------|-------------|
+| **Entities** | |
+| `Booking.java` | JPA entity → `bookings` table. PNR, user, train run, status, fare, optimistic locking (`@Version`) |
+| `BookingPassenger.java` | JPA entity → `booking_passengers` table. Per-passenger: name, age, seat/coach assignment, status |
+| `SeatInventory.java` | JPA entity → `seat_inventory` table. Tracks available seats per (train_run, coach_type, from_station, to_station) segment |
+| `TrainRun.java` | JPA entity → `train_runs` table. A concrete "Train X on Date Y" that can be booked |
+| `BookingStatus.java` | Enum: INITIATED, PAYMENT_PENDING, CONFIRMED, WAITLISTED, RAC, CANCELLED, FAILED |
+| **Redis Services** | |
+| `SeatLockManager.java` | Distributed seat locking via Redis Lua scripts. Atomic check-and-decrement with TTL |
+| `AvailabilityCache.java` | Write-through cache for seat availability. Key: `avail:{trainRunId}:{coachType}` |
+| `PnrCache.java` | Cache-aside pattern for PNR lookups. Key: `pnr:{pnr}` |
+| `IdempotencyStore.java` | Prevents duplicate bookings. 24hr TTL with processing/completed states |
+| **Core Services** | |
+| `BookingService.java` | The orchestrator: idempotency → validate → lock seats → create booking → evict cache |
+| `SeatAvailabilityService.java` | Redis-first availability lookup with DB fallback |
+| `PnrStatusService.java` | Redis-first PNR lookup with DB fallback |
+| `TrainRunService.java` | Materializes schedules into bookable train runs with seat inventory |
+| `PnrGenerator.java` | Generates unique PNR numbers: "PNR" + 7 random digits |
+| **Rate Limiting** | |
+| `RateLimit.java` | Custom annotation: `@RateLimit(requests = 5, windowSeconds = 60)` |
+| `RateLimitInterceptor.java` | Redis sliding window via Lua script. Sets `X-RateLimit-Remaining` header |
+| `BookingWebConfig.java` | Registers the rate limit interceptor on `/api/v1/**` |
+| **Controllers** | |
+| `BookingController.java` | `POST /bookings` (5/min limit), `GET /bookings/{pnr}`, `GET /bookings/my` |
+| `AvailabilityController.java` | `GET /availability?trainRunId&coachType` (30/min limit) |
+| `PnrController.java` | `GET /pnr/{pnr}` (20/min limit) |
+| `AdminBookingController.java` | `POST /admin/train-runs/generate` (admin only) |
+
+### railway-payment, railway-notification
+
+**Purpose**: Stubs for now. Each has only a `@Configuration` class so Maven can build them. Real implementation comes in Phases 3 and 5.
 
 ### railway-app
 
@@ -772,8 +807,9 @@ Database connections are expensive to create (~50-100ms). A connection pool main
 | `RailwayApplication.java` | Spring Boot main class. `@SpringBootApplication(scanBasePackages = "com.railway")` tells Spring to scan ALL modules |
 | `SecurityConfig.java` | URL access rules, JWT filter chain, password encoder, auth manager |
 | `SwaggerConfig.java` | OpenAPI documentation with JWT auth support |
-| `application.yml` | All configuration: database URL, JWT settings, Flyway, etc. |
-| `V1-V4 migrations` | SQL files that create all database tables |
+| `RedisConfig.java` | RedisTemplate with Jackson JSON serializer for object storage |
+| `application.yml` | All configuration: database, JWT, Redis, rate limits, cache TTLs |
+| `V1-V5 migrations` | SQL files that create all database tables (V5 adds booking tables) |
 
 ---
 
@@ -806,11 +842,304 @@ Database connections are expensive to create (~50-100ms). A connection pool main
 
 ---
 
-## 15. What's Coming Next
+## 15. Redis & Distributed Systems Patterns (Phase 2)
+
+Phase 2 introduces Redis as a critical infrastructure component alongside PostgreSQL. Redis is an in-memory data store — think of it as a super-fast HashMap that lives outside your application, shared across all instances.
+
+### Why Redis? Why not just use PostgreSQL for everything?
+
+| Concern | PostgreSQL | Redis |
+|---------|-----------|-------|
+| **Speed** | ~1-5ms per query (disk-based) | ~0.1ms per operation (in-memory) |
+| **Concurrency** | Row locks, potential deadlocks | Single-threaded, atomic operations |
+| **TTL (auto-expiry)** | Requires scheduled jobs | Built-in per-key TTL |
+| **Distributed locking** | Advisory locks (tricky to use) | Purpose-built primitives |
+
+We use **both** together. PostgreSQL is the **source of truth** (durable, ACID). Redis is the **speed layer** (caching, locking, rate limiting). If Redis goes down, the system still works — just slower.
+
+### Pattern 1: Distributed Seat Locking (SeatLockManager)
+
+**The problem**: User A and User B both try to book the last seat on the same train at the same instant. Without coordination, both bookings succeed and we've sold a phantom seat.
+
+**Why not just use database locks?** Database row locks work for a single database. But they hold connections open during the entire payment window (up to 10 minutes). With 1000 concurrent bookings, you'd need 1000 database connections — killing your connection pool.
+
+**The solution**: Redis distributed lock with Lua script.
+
+```
+Lua script runs ATOMICALLY on Redis (single-threaded, no interruption):
+
+1. Read current available seats count
+2. If seats >= requested amount:
+   a. Decrement the availability counter
+   b. Set a lock key with the booking ID as owner
+   c. Set TTL (10 minutes) — auto-releases if payment never completes
+   d. Return SUCCESS
+3. Else: Return FAILURE
+```
+
+**Why Lua scripts?** Redis is single-threaded, but individual commands could interleave between your application's check-and-set. A Lua script runs as one atomic unit — no other command can execute in the middle.
+
+**Key design decisions:**
+- **10-minute TTL**: If the user never pays, the lock auto-releases and seats become available again
+- **Lock owner tracking**: We store the booking ID in the lock value so only the booking that locked the seats can release them
+- **Dual-layer safety**: Redis lock (fast, might lose data on crash) + PostgreSQL `@Version` optimistic lock (durable, catches any slip-through)
+
+```
+Redis Keys:
+  seat-lock:{trainRunId}:{coachType}:{fromStation}:{toStation}:{bookingId}  →  "1"  (TTL: 600s)
+  seat-avail:{trainRunId}:{coachType}:{fromStation}:{toStation}             →  "42" (available count)
+```
+
+### Pattern 2: Write-Through Cache (AvailabilityCache)
+
+**The problem**: Seat availability is the most-read data in the system. Every search query checks it. Hitting PostgreSQL for every availability check would overwhelm the database.
+
+**Write-through** means: every time data changes, we update BOTH the database AND the cache. The cache is always up-to-date.
+
+```
+READ path:
+  Client asks "how many seats?" → Check Redis → Hit? Return cached data
+                                              → Miss? Query PostgreSQL → Store in Redis → Return
+
+WRITE path:
+  Booking happens → Update PostgreSQL → Update Redis → Return
+  Cancellation    → Update PostgreSQL → Evict Redis  → Return
+```
+
+**Why not cache-aside here?** Cache-aside only populates the cache on reads. With availability, stale data means selling seats that don't exist. Write-through guarantees the cache always reflects reality.
+
+**TTL (5 minutes)**: Even with write-through, we set a TTL as a safety net. If a cache update fails somehow, the stale entry expires within 5 minutes and the next read re-populates from PostgreSQL.
+
+```
+Redis Key: avail:{trainRunId}:{coachType}  →  JSON{ totalSeats, availableSeats, racSeats, ... }
+```
+
+### Pattern 3: Cache-Aside (PnrCache)
+
+**The problem**: PNR status lookups are frequent but PNR data changes infrequently (only on booking status changes). We want fast reads without always hitting the database.
+
+**Cache-aside** (also called "lazy loading") means: only populate the cache when someone asks for the data.
+
+```
+READ path:
+  Client asks "PNR status?" → Check Redis → Hit? Return cached data (fast!)
+                                           → Miss? Query PostgreSQL → Store in Redis → Return
+
+WRITE path (on booking status change):
+  Status changes → Update PostgreSQL → EVICT from Redis (don't update)
+  Next read will re-populate the cache from the fresh DB data
+```
+
+**Why evict instead of update?** PNR status has complex nested data (multiple passengers, each with their own status). It's simpler and safer to just delete the cached entry and let the next read rebuild it, rather than trying to surgically update nested JSON.
+
+**TTL (15 minutes)**: Longer than availability cache because PNR data changes less frequently. If someone checks their PNR and it's been evicted, the worst case is a single database query to re-cache.
+
+```
+Redis Key: pnr:{pnr}  →  JSON{ pnr, status, passengers: [...] }
+```
+
+### Pattern 4: Sliding Window Rate Limiting (RateLimitInterceptor)
+
+**The problem**: Without rate limiting, a single user (or bot) can flood your API with thousands of requests per second, degrading service for everyone.
+
+**Why not a simple counter?** A fixed counter like "100 requests per minute" has a boundary problem: a user could send 100 requests at 11:59:59 and 100 more at 12:00:01 — that's 200 requests in 2 seconds, all "within the limit."
+
+**Sliding window** tracks the exact timestamp of each request:
+
+```
+Lua script (atomic):
+1. Remove all entries older than the window (e.g., > 60 seconds ago)
+2. Count remaining entries
+3. If count < limit:
+   a. Add current timestamp to the sorted set
+   b. Set key TTL = window size
+   c. Return remaining quota
+4. Else: Return -1 (rate limited)
+```
+
+**Why Redis sorted sets?** A sorted set (ZSET) stores members sorted by score. We use timestamps as scores. `ZREMRANGEBYSCORE` efficiently removes expired entries. `ZCARD` counts remaining entries. It's the perfect data structure for sliding windows.
+
+**Per-endpoint limits:**
+- Availability search: 30 requests/minute (frequent, lightweight)
+- Booking creation: 5 requests/minute (expensive, involves locking)
+- PNR check: 20 requests/minute (moderate)
+
+```
+Redis Key: rate-limit:{prefix}:{userId}  →  Sorted Set { (timestamp1, member1), (timestamp2, member2), ... }
+```
+
+### Pattern 5: Idempotency (IdempotencyStore)
+
+**The problem**: Networks are unreliable. A user clicks "Book" but gets a timeout. Did the booking succeed? They click again. Without idempotency, they might get charged twice for the same booking.
+
+**Idempotency** means: sending the same request multiple times produces the same result as sending it once.
+
+```
+First request with key "abc-123":
+  1. Check Redis: key "abc-123" → not found
+  2. Set Redis: "abc-123" → "PROCESSING" (with 24hr TTL)
+  3. Process booking normally
+  4. On success: Update Redis: "abc-123" → "COMPLETED|PNR1234567"
+  5. Return booking response
+
+Second request with same key "abc-123":
+  1. Check DB first: find booking with idempotency_key = "abc-123" → found!
+  2. Return the SAME booking response (no duplicate booking created)
+
+Second request while first is still processing:
+  1. Check DB: not found yet
+  2. Check Redis: "abc-123" → "PROCESSING"
+  3. Return error: "Request is already being processed"
+```
+
+**Two layers of protection:**
+- **Redis**: Fast check for in-flight requests (prevents double-submit within milliseconds)
+- **PostgreSQL**: Durable check via unique constraint on `idempotency_key` column (catches anything Redis misses)
+
+**24-hour TTL**: The idempotency key expires after 24 hours. After that, the same key can be reused. This balances protection against duplicates vs. not storing keys forever.
+
+### Pattern 6: Optimistic Locking (@Version)
+
+**The problem**: Two threads read the same `seat_inventory` row showing 5 available seats. Both try to decrement to 4. Without protection, we lose one decrement — showing 4 seats when there should be 3.
+
+**Optimistic locking** means: don't lock the row upfront. Instead, check at write time that nobody else modified it.
+
+```sql
+-- Repository method:
+UPDATE seat_inventory
+SET available_seats = available_seats - :count, version = version + 1
+WHERE id = :id AND version = :expectedVersion
+
+-- If version changed between read and write, updated_rows = 0 → we know there was a conflict
+```
+
+**Why "optimistic"?** We optimistically assume no conflict will happen (which is true 99% of the time). We only handle conflicts when they occur. Compare with "pessimistic locking" (SELECT FOR UPDATE) which blocks other readers/writers preemptively.
+
+**How it works with Redis locks**: Redis lock is the first line of defense (fast, distributed). `@Version` is the safety net in case the Redis lock fails (Redis crashed, TTL expired early, etc.). Belt and suspenders.
+
+---
+
+## 16. The Booking Engine — How It All Fits Together
+
+### The Complete Booking Flow
+
+Here's what happens when a user clicks "Book Now", step by step:
+
+```
+User clicks "Book Now"
+       │
+       ▼
+┌──────────────────────┐
+│  1. IDEMPOTENCY      │  Check if this exact request was already processed
+│     CHECK             │  Redis (fast) → DB unique constraint (durable)
+└──────────┬───────────┘
+           │
+           ▼
+┌──────────────────────┐
+│  2. VALIDATE          │  Check: ≤6 passengers, different from/to stations,
+│     REQUEST           │  train run is SCHEDULED status
+└──────────┬───────────┘
+           │
+           ▼
+┌──────────────────────┐
+│  3. CHECK             │  Redis cache (0.1ms) → PostgreSQL fallback (2ms)
+│     AVAILABILITY      │  "Are there enough seats on this segment?"
+└──────────┬───────────┘
+           │
+           ▼
+┌──────────────────────┐
+│  4. LOCK SEATS        │  Redis Lua script: atomically decrement availability
+│     IN REDIS          │  Set lock with 10-min TTL (payment window)
+└──────────┬───────────┘
+           │
+           ▼
+┌──────────────────────┐
+│  5. DECREMENT DB      │  PostgreSQL: UPDATE with @Version check
+│     (OPTIMISTIC LOCK) │  If version conflict → release Redis lock → retry
+└──────────┬───────────┘
+           │
+           ▼
+┌──────────────────────┐
+│  6. CREATE BOOKING    │  PostgreSQL: INSERT booking + passengers
+│     IN DATABASE       │  Status: PAYMENT_PENDING, generate PNR
+└──────────┬───────────┘
+           │
+           ▼
+┌──────────────────────┐
+│  7. EVICT CACHE       │  Remove stale availability from Redis
+│                       │  Next read will re-populate from DB
+└──────────┬───────────┘
+           │
+           ▼
+┌──────────────────────┐
+│  8. RETURN PNR        │  HTTP 201: { pnr: "PNR1234567", status: "PAYMENT_PENDING" }
+│     TO USER           │  User has 10 minutes to complete payment
+└──────────────────────┘
+```
+
+### Train Run Materialization
+
+Before anyone can book a ticket, we need to materialize abstract schedules into concrete, bookable train runs:
+
+```
+Schedule: "Train 12301 runs Mon/Wed/Fri"
+    +
+Date Range: "April 1 - April 30"
+    ↓
+Materialized TrainRuns:
+    - Train 12301, April 1 (Monday)     ← each is a bookable entity
+    - Train 12301, April 3 (Wednesday)
+    - Train 12301, April 5 (Friday)
+    - ... etc
+
+For each TrainRun, create SeatInventory:
+    - TrainRun #1, FIRST_AC, Delhi→Jaipur, 72 seats available
+    - TrainRun #1, FIRST_AC, Jaipur→Ahmedabad, 72 seats available
+    - TrainRun #1, SLEEPER, Delhi→Jaipur, 200 seats available
+    - ... (every coach_type × every consecutive station pair)
+```
+
+**Why materialize?** You can't query "is Train 12301 available on April 5?" efficiently against a schedule table. Materializing creates concrete rows you can index, cache, and lock.
+
+### Expired Booking Cleanup
+
+A safety net for when users abandon bookings without paying:
+
+```
+@Scheduled(every 10 minutes):
+  1. Find all bookings where status = PAYMENT_PENDING
+     AND createdAt < (now - 10 minutes)
+  2. For each expired booking:
+     a. Set status → FAILED
+     b. INCREMENT seat_inventory (give seats back)
+     c. Evict availability cache (force refresh)
+     d. Evict PNR cache
+  3. Log how many bookings were cleaned up
+```
+
+This runs alongside Redis TTL auto-expiry. Redis handles the lock release; this job handles the database state cleanup.
+
+### Segment-Based Availability Recap
+
+Remember from Section 6: railway seats are reusable across segments. When checking availability for Delhi→Mumbai on a route Delhi→Jaipur→Ahmedabad→Mumbai:
+
+```
+A booking from Delhi→Ahmedabad must decrement:
+  - Delhi→Jaipur segment     (passenger occupies seat here)
+  - Jaipur→Ahmedabad segment (passenger still on the train)
+
+But NOT:
+  - Ahmedabad→Mumbai segment (passenger got off — seat is free!)
+```
+
+The `seat_inventory` table has one row per (train_run, coach_type, from_station, to_station) for consecutive station pairs. This is the fundamental data model that makes Indian railway booking work.
+
+---
+
+## 17. What's Coming Next
 
 | Phase | What | Key Concept You'll Learn |
 |-------|------|-------------------------|
-| **Phase 2** (Week 3-4) | Booking engine + Redis | **Distributed locking** — how to prevent two users from booking the same seat. **Caching** — make PNR lookup 100x faster. **Rate limiting** — prevent bots from flooding the booking API. |
 | **Phase 3** (Week 5-6) | Payments + Kafka | **Event-driven architecture** — booking confirmation happens asynchronously via events. **Exactly-once delivery** — payments must never be processed twice. |
 | **Phase 4** (Week 7-8) | Elasticsearch + CQRS | **CQRS pattern** — writes go to PostgreSQL, reads come from Elasticsearch. **Eventual consistency** — the search index lags behind by milliseconds. |
 | **Phase 5** (Week 9-10) | Waitlist, cancellations, notifications | **Event choreography** — one cancellation triggers: refund + waitlist promotion + notification, all via events. |
@@ -818,7 +1147,7 @@ Database connections are expensive to create (~50-100ms). A connection pool main
 
 ---
 
-## 16. File Reference Guide
+## 18. File Reference Guide
 
 Quick reference to find any file:
 
@@ -826,7 +1155,7 @@ Quick reference to find any file:
 docs/ARCHITECTURE.md                                    ← THIS FILE
 
 pom.xml                                                 ← Parent Maven POM
-docker/docker-compose.yml                               ← PostgreSQL container
+docker/docker-compose.yml                               ← PostgreSQL + Redis containers
 
 railway-common/src/main/java/com/railway/common/
 ├── dto/ErrorResponse.java                              ← API error format
@@ -868,11 +1197,51 @@ railway-train/src/main/java/com/railway/train/
 ├── controller/RouteController.java                     ← /api/v1/routes/*, /api/v1/admin/schedules
 └── dto/*.java                                          ← Request/Response DTOs
 
+railway-booking/src/main/java/com/railway/booking/
+├── entity/
+│   ├── Booking.java                                    ← Booking JPA entity (PNR, status, @Version)
+│   ├── BookingPassenger.java                           ← Per-passenger details + seat assignment
+│   ├── SeatInventory.java                              ← Segment-based availability (@Version)
+│   ├── TrainRun.java                                   ← Materialized train run (schedule + date)
+│   └── BookingStatus.java                              ← Enum: INITIATED → CONFIRMED / FAILED
+├── repository/
+│   ├── BookingRepository.java                          ← findByPnr, findExpired, by user
+│   ├── BookingPassengerRepository.java                 ← findByBookingId
+│   ├── SeatInventoryRepository.java                    ← decrement/increment with @Version
+│   └── TrainRunRepository.java                         ← findByTrainAndDate
+├── redis/
+│   ├── SeatLockManager.java                            ← Distributed locking via Lua scripts
+│   ├── AvailabilityCache.java                          ← Write-through availability cache
+│   ├── PnrCache.java                                   ← Cache-aside PNR lookup
+│   └── IdempotencyStore.java                           ← Duplicate request prevention
+├── service/
+│   ├── BookingService.java                             ← THE ORCHESTRATOR: lock→book→cache
+│   ├── SeatAvailabilityService.java                    ← Redis-first availability check
+│   ├── PnrStatusService.java                           ← Redis-first PNR lookup
+│   ├── TrainRunService.java                            ← Schedule → TrainRun materialization
+│   └── PnrGenerator.java                              ← "PNR" + 7 random digits
+├── ratelimit/
+│   ├── RateLimit.java                                  ← Custom @RateLimit annotation
+│   ├── RateLimitInterceptor.java                       ← Redis sliding window enforcement
+│   └── BookingWebConfig.java                           ← Register interceptor on /api/v1/**
+├── controller/
+│   ├── BookingController.java                          ← POST /bookings, GET /bookings/{pnr}
+│   ├── AvailabilityController.java                     ← GET /availability
+│   ├── PnrController.java                              ← GET /pnr/{pnr}
+│   └── AdminBookingController.java                     ← POST /admin/train-runs/generate
+└── dto/
+    ├── BookingRequest.java                             ← Booking + passengers input
+    ├── BookingResponse.java                            ← Booking + passengers output
+    ├── SeatAvailabilityResponse.java                   ← Available seats for a segment
+    ├── PnrStatusResponse.java                          ← PNR + passenger statuses
+    └── GenerateTrainRunsRequest.java                   ← Admin: trainId + date range
+
 railway-app/src/main/java/com/railway/app/
 ├── RailwayApplication.java                             ← Main class
 └── config/
     ├── SecurityConfig.java                             ← URL access rules, JWT filter
-    └── SwaggerConfig.java                              ← API documentation
+    ├── SwaggerConfig.java                              ← API documentation
+    └── RedisConfig.java                                ← Redis JSON serialization config
 
 railway-app/src/main/resources/
 ├── application.yml                                     ← All configuration
@@ -880,7 +1249,8 @@ railway-app/src/main/resources/
     ├── V1__create_users.sql                            ← Users table
     ├── V2__create_stations_trains.sql                  ← Stations + Trains tables
     ├── V3__create_routes_schedules.sql                 ← Routes, RouteStations, Schedules, TrainRuns
-    └── V4__create_coaches_seats.sql                    ← Coaches + SeatInventory tables
+    ├── V4__create_coaches_seats.sql                    ← Coaches + SeatInventory tables
+    └── V5__create_bookings.sql                         ← Bookings, Passengers, SeatAllocations
 ```
 
 ---
@@ -888,7 +1258,7 @@ railway-app/src/main/resources/
 ## How to Run
 
 ```bash
-# 1. Start PostgreSQL
+# 1. Start PostgreSQL + Redis
 docker compose -f docker/docker-compose.yml up -d
 
 # 2. Build the project
@@ -904,4 +1274,7 @@ mvn spring-boot:run -pl railway-app
 curl -X POST http://localhost:8080/api/v1/auth/register \
   -H "Content-Type: application/json" \
   -d '{"email":"test@example.com","password":"secret123","fullName":"Test User"}'
+
+# 6. Check Redis keys (after some bookings)
+docker exec -it railway-redis redis-cli KEYS '*'
 ```

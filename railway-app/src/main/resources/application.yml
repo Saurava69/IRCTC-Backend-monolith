@@ -30,6 +30,12 @@ spring:
       write-dates-as-timestamps: false
     default-property-inclusion: non_null
 
+  data:
+    redis:
+      host: localhost
+      port: 6379
+      timeout: 2000ms
+
 server:
   port: 8080
 
@@ -38,6 +44,20 @@ app:
     secret: this-is-a-256-bit-secret-key-for-jwt-signing-change-in-prod-env
     expiration-ms: 3600000
     refresh-expiration-ms: 86400000
+
+  booking:
+    seat-lock-ttl-seconds: 600
+    payment-timeout-seconds: 600
+    max-passengers-per-booking: 6
+
+  rate-limit:
+    search-per-minute: 30
+    booking-per-minute: 5
+    pnr-check-per-minute: 20
+
+  cache:
+    availability-ttl-minutes: 5
+    pnr-ttl-minutes: 15
 
 springdoc:
   swagger-ui:
