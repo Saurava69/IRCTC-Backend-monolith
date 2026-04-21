@@ -27,8 +27,10 @@
 18. [Concurrency Control — The Full Picture](#18-concurrency-control--the-full-picture)
 19. [Java Records & Modern Java](#19-java-records--modern-java)
 20. [Lombok](#20-lombok)
-21. [What's Coming — Kafka, Elasticsearch, CQRS](#21-whats-coming--kafka-elasticsearch-cqrs)
-22. [Learning Resources](#22-learning-resources)
+21. [Apache Kafka & Event-Driven Architecture](#21-apache-kafka--event-driven-architecture)
+22. [Payment Processing Patterns](#22-payment-processing-patterns)
+23. [What's Coming — Elasticsearch, CQRS, Waitlist](#23-whats-coming--elasticsearch-cqrs-waitlist)
+24. [Learning Resources](#24-learning-resources)
 
 ---
 
@@ -1404,23 +1406,251 @@ Booking booking = Booking.builder()
 
 ---
 
-## 21. What's Coming — Kafka, Elasticsearch, CQRS
+## 21. Apache Kafka & Event-Driven Architecture
 
-### Phase 3: Kafka (Event-Driven Architecture)
+### What is Kafka?
 
-**What**: Instead of direct method calls, services communicate through events on a message broker.
+Apache Kafka is a distributed event streaming platform. Think of it as a highly durable, high-throughput message queue where:
+- **Producers** write messages (events) to **topics**
+- **Consumers** read messages from topics
+- Messages are **persisted to disk** (not lost after reading)
+- Multiple consumers can independently read the same messages
+
+### Why Event-Driven?
+
+**Without events (direct calls):**
+```java
+// BookingService.java — tightly coupled
+public void initiateBooking(...) {
+    booking = save(booking);
+    paymentService.process(booking);      // What if payment service is down?
+    notificationService.send(booking);    // What if notification fails?
+    searchIndexer.update(booking);        // Booking fails because indexer is broken?
+}
+```
+
+**With events (decoupled):**
+```java
+// BookingService.java — just publishes an event
+public void initiateBooking(...) {
+    booking = save(booking);
+    kafkaTemplate.send("booking.events", bookingEvent);  // Fire and forget
+    // Payment, notification, search — all independent consumers
+}
+```
+
+**Benefits:**
+1. **Decoupling** — BookingService doesn't import PaymentService. Add a new consumer (analytics, fraud detection) without touching booking code
+2. **Resilience** — If payment service is down, events queue up in Kafka. When it comes back, it processes the backlog
+3. **Scalability** — Add more consumer instances to handle higher load. Kafka distributes partitions across them
+4. **Auditability** — Every event is persisted. You have a complete history of everything that happened
+
+### Key Kafka Concepts
+
+| Concept | Explanation |
+|---------|------------|
+| **Topic** | A named channel for events. Like a database table for events. |
+| **Partition** | A topic is split into partitions for parallelism. Ordering is guaranteed within a partition. |
+| **Partition Key** | Determines which partition a message goes to. Same key = same partition = guaranteed order. |
+| **Consumer Group** | Multiple consumers sharing the work. Each partition is read by only one consumer in the group. |
+| **Offset** | A position in a partition. Each consumer tracks its offset (how far it's read). |
+| **Broker** | A Kafka server. In production, you run 3+ brokers for fault tolerance. |
+
+### How We Use Kafka
 
 ```
-Current (Phase 2):
-    BookingService.initiateBooking() → directly calls everything
-
-Future (Phase 3):
-    BookingService → publishes "BOOKING_INITIATED" event to Kafka
-    PaymentConsumer → listens for event → processes payment
-    NotificationConsumer → listens for event → sends email
+Our Topics:
+  booking.events    (key: trainRunId)   →  Booking lifecycle events
+  payment.events    (key: bookingId)    →  Payment result events
+  *.retry           (auto-created)      →  Failed messages for retry
+  *.dlt             (dead letter)       →  Messages that failed after all retries
 ```
 
-**Why**: Decoupling. The booking service doesn't need to know about payments or notifications. New consumers can be added without changing the booking code.
+**Producer example (our code):**
+```java
+// BookingEventPublisher.java
+EventEnvelope<BookingEvent> envelope = EventEnvelope.<BookingEvent>builder()
+    .eventType("BOOKING_INITIATED")
+    .aggregateId(String.valueOf(booking.getId()))
+    .source("railway-booking")
+    .payload(bookingEvent)
+    .build();
+
+kafkaTemplate.send("booking.events",
+    String.valueOf(booking.getTrainRunId()),  // Partition key
+    envelope);
+```
+
+**Consumer example (our code):**
+```java
+// PaymentEventConsumer.java
+@KafkaListener(topics = "${app.kafka.topics.payment-events}", groupId = "booking-service")
+@Transactional
+public void handlePaymentEvent(EventEnvelope<?> envelope) {
+    PaymentEvent event = objectMapper.convertValue(envelope.getPayload(), PaymentEvent.class);
+    switch (envelope.getEventType()) {
+        case "PAYMENT_SUCCESS" -> handlePaymentSuccess(event);
+        case "PAYMENT_FAILED"  -> handlePaymentFailed(event);
+    }
+}
+```
+
+### Serialization — How Objects Become Kafka Messages
+
+```yaml
+# application.yml
+spring.kafka.producer:
+  value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
+spring.kafka.consumer:
+  value-deserializer: org.springframework.kafka.support.serializer.JsonDeserializer
+  properties:
+    spring.json.trusted.packages: "com.railway.*"
+```
+
+Producer serializes Java objects → JSON bytes. Consumer deserializes JSON bytes → Java objects. The `trusted.packages` setting is a security measure — Kafka won't deserialize arbitrary classes (prevents deserialization attacks).
+
+### Dead Letter Topics (DLT) — Handling Poison Pills
+
+What happens when a consumer can't process a message?
+
+```java
+@RetryableTopic(
+    attempts = "3",                              // Try 3 times total
+    backoff = @Backoff(delay = 1000, multiplier = 2)  // 1s, 2s, 4s
+)
+@KafkaListener(topics = "payment.events")
+public void handlePaymentEvent(EventEnvelope<?> envelope) {
+    // If this throws an exception:
+    // 1st attempt: immediate
+    // 2nd attempt: after 1 second
+    // 3rd attempt: after 2 seconds
+    // After 3rd failure → message goes to payment.events.dlt
+}
+
+@DltHandler
+public void handleDlt(EventEnvelope<?> envelope) {
+    log.error("Dead letter: {}", envelope.getEventType());
+    // Alert ops team, save to a DB table, etc.
+}
+```
+
+**Why not infinite retries?** A malformed message will fail forever, blocking all other messages in the partition. Better to quarantine it in the DLT and process the rest.
+
+### Consumer Idempotency
+
+Kafka guarantees **at-least-once delivery** — a message might be delivered more than once (network retry, consumer restart). Your consumer must handle duplicates:
+
+```java
+private void handlePaymentSuccess(PaymentEvent event) {
+    Booking booking = bookingRepository.findById(event.bookingId()).orElseThrow();
+
+    // IDEMPOTENCY CHECK — if already confirmed, skip
+    if (booking.getBookingStatus() == BookingStatus.CONFIRMED) {
+        log.info("Already confirmed, skipping duplicate");
+        return;
+    }
+
+    booking.setBookingStatus(BookingStatus.CONFIRMED);
+    bookingRepository.save(booking);
+}
+```
+
+### Topic Creation via Spring Beans
+
+```java
+// KafkaConfig.java
+@Bean
+public NewTopic bookingEventsTopic() {
+    return TopicBuilder.name("booking.events")
+        .partitions(3)    // 3 partitions for parallelism
+        .replicas(1)      // 1 replica (dev only; production needs 3)
+        .build();
+}
+```
+
+Spring Kafka auto-creates these topics on application startup. In production, you'd create topics via infrastructure tooling with proper replication.
+
+### Learn More
+- [Apache Kafka Documentation](https://kafka.apache.org/documentation/)
+- [Confluent — Kafka 101](https://developer.confluent.io/learn-kafka/)
+- [Designing Data-Intensive Applications — Ch. 11](https://dataintensive.net/) (Stream Processing)
+- [Spring Kafka Reference](https://docs.spring.io/spring-kafka/reference/)
+- [Kafka: The Definitive Guide (book)](https://www.confluent.io/resources/kafka-the-definitive-guide-v2/)
+
+---
+
+## 22. Payment Processing Patterns
+
+### Mock Gateway Pattern
+
+In real systems, you integrate with payment gateways (Razorpay, Stripe, PayPal). During development, we use a mock:
+
+```java
+// MockPaymentGateway.java
+public GatewayResponse processPayment(Long bookingId, BigDecimal amount, String method) {
+    Thread.sleep(ThreadLocalRandom.current().nextInt(50, 200));  // Simulate latency
+
+    boolean success = ThreadLocalRandom.current().nextInt(100) < 90;  // 90% success rate
+    String transactionId = "TXN-" + UUID.randomUUID().toString().substring(0, 12);
+
+    return new GatewayResponse(success, transactionId, message, failureReason);
+}
+```
+
+**Why mock?** You don't want to hit a real payment gateway during development. The mock simulates real-world conditions: variable latency, occasional failures, and unique transaction IDs.
+
+**Why 90% success?** Real payment gateways fail 5-15% of the time (expired cards, insufficient funds, network issues). Testing only the happy path hides bugs in your error handling.
+
+### The Payment State Machine
+
+```
+INITIATED → PROCESSING → SUCCESS  (happy path)
+                      → FAILED   (gateway rejected)
+                                 → RETRY → PROCESSING → SUCCESS/FAILED
+SUCCESS → REFUNDED  (on cancellation — Phase 5)
+```
+
+Each state transition is persisted to the database AND published as a Kafka event. This means:
+1. The payment record in PostgreSQL is the source of truth
+2. The Kafka event triggers downstream actions (booking confirmation, notifications)
+3. If Kafka is down, the payment record still reflects the correct state
+
+### Cross-Module Communication Without Direct Dependencies
+
+The payment module needs to know the booking's PNR and fare. But it can't import `Booking.java` (wrong module). Solution: native SQL query.
+
+```java
+// PaymentService.java — reads from bookings table directly
+private Object[] lookupBooking(Long bookingId) {
+    return entityManager.createNativeQuery(
+        "SELECT b.pnr, b.total_fare, b.booking_status FROM bookings b WHERE b.id = :id"
+    ).setParameter("id", bookingId).getResultList().get(0);
+}
+```
+
+This respects the modular monolith boundary: modules share a database but don't share Java classes. When you extract to microservices, this query becomes an API call.
+
+### Payment Retry
+
+Failed payments can be retried without creating a duplicate:
+
+```
+POST /api/v1/payments/{paymentId}/retry
+
+→ Check: payment must be in FAILED status
+→ Create a new Payment record (not modify the old one — audit trail!)
+→ Call gateway again
+→ Publish new event
+```
+
+### Learn More
+- [Stripe — Building Robust Payment Systems](https://stripe.com/docs/payments)
+- [Idempotent Payment Processing](https://stripe.com/docs/api/idempotent_requests)
+- [Martin Fowler — Event-Driven Architecture](https://martinfowler.com/articles/201701-event-driven.html)
+
+---
+
+## 23. What's Coming — Elasticsearch, CQRS, Waitlist
 
 ### Phase 4: Elasticsearch (CQRS)
 
@@ -1444,7 +1674,7 @@ Testcontainers (integration tests with real Docker containers), circuit breakers
 
 ---
 
-## 22. Learning Resources
+## 24. Learning Resources
 
 ### Books (Highly Recommended)
 

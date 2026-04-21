@@ -23,8 +23,10 @@
 14. [The Railway Domain - Key Concepts](#14-the-railway-domain---key-concepts)
 15. [Redis & Distributed Systems Patterns (Phase 2)](#15-redis--distributed-systems-patterns-phase-2)
 16. [The Booking Engine — How It All Fits Together](#16-the-booking-engine--how-it-all-fits-together)
-17. [What's Coming Next (Phase 3-6)](#17-whats-coming-next)
-18. [File Reference Guide](#18-file-reference-guide)
+17. [Kafka & Event-Driven Architecture (Phase 3)](#17-kafka--event-driven-architecture-phase-3)
+18. [The Payment Flow — End to End](#18-the-payment-flow--end-to-end)
+19. [What's Coming Next (Phase 4-6)](#19-whats-coming-next)
+20. [File Reference Guide](#20-file-reference-guide)
 
 ---
 
@@ -1136,32 +1138,197 @@ The `seat_inventory` table has one row per (train_run, coach_type, from_station,
 
 ---
 
-## 17. What's Coming Next
+## 17. Kafka & Event-Driven Architecture (Phase 3)
+
+Phase 3 introduces Apache Kafka for asynchronous, event-driven communication between modules. Instead of direct method calls, services publish events to Kafka topics. Other services consume those events independently.
+
+### Why Events? Why not just call the payment service directly?
+
+| Direct Calls | Event-Driven |
+|-------------|-------------|
+| Booking module must know about payment module | Booking just publishes "BOOKING_INITIATED" — doesn't care who listens |
+| If payment is down, booking fails | Booking succeeds immediately; payment processes when ready |
+| Adding notifications = modifying booking code | Add a new consumer — booking code stays unchanged |
+| Tight coupling between modules | Loose coupling — modules communicate through shared events |
+
+### Kafka Architecture in Our System
+
+```
+                    ┌──────────────────┐
+                    │   booking.events │ (3 partitions)
+                    │   Topic          │
+                    └──────┬───────────┘
+                           │
+    ┌──────────────────────┼──────────────────────┐
+    │                      │                      │
+    ▼                      ▼                      ▼
+┌─────────────┐   ┌──────────────┐   ┌──────────────────┐
+│ (future)    │   │ Notification │   │ (future)         │
+│ Search      │   │ Consumer     │   │ Analytics        │
+│ Indexer     │   │ (logs mock   │   │ Consumer         │
+│             │   │  email/SMS)  │   │                  │
+└─────────────┘   └──────────────┘   └──────────────────┘
+
+                    ┌──────────────────┐
+                    │  payment.events  │ (3 partitions)
+                    │  Topic           │
+                    └──────┬───────────┘
+                           │
+                           ▼
+                    ┌──────────────┐
+                    │ Payment      │
+                    │ Event        │
+                    │ Consumer     │
+                    │ (confirms/   │
+                    │  fails       │
+                    │  bookings)   │
+                    └──────────────┘
+```
+
+### Topics We Create
+
+| Topic | Partitions | Key | Purpose |
+|-------|-----------|-----|---------|
+| `booking.events` | 3 | trainRunId | Booking lifecycle events |
+| `payment.events` | 3 | bookingId | Payment result events |
+| `notification.events` | 3 | — | (Phase 5) notification delivery |
+| `booking.events.retry` | 1 | — | Auto-retry on processing failure |
+| `booking.events.dlt` | 1 | — | Dead letter — unprocessable messages |
+| `payment.events.dlt` | 1 | — | Dead letter for payment events |
+
+**Partition key matters!** We key `booking.events` by `trainRunId` so all events for the same train run land on the same partition — guaranteeing **ordering** within a train run. We key `payment.events` by `bookingId` for ordering within a booking.
+
+### EventEnvelope — The Standard Message Wrapper
+
+Every Kafka message is wrapped in `EventEnvelope<T>`:
+
+```java
+EventEnvelope<BookingEvent> envelope = EventEnvelope.<BookingEvent>builder()
+    .eventType("BOOKING_INITIATED")     // What happened
+    .aggregateId("42")                  // Which entity
+    .aggregateType("Booking")           // Entity type
+    .source("railway-booking")          // Which module published it
+    .correlationId("PNR1234567")        // For request tracing
+    .idempotencyKey("abc-123")          // Prevent duplicate processing
+    .payload(bookingEvent)              // The actual event data
+    .build();
+// eventId (UUID) and timestamp auto-generated
+```
+
+**Why a wrapper?** Every consumer needs metadata: who published it, when, what type. Without a wrapper, every event type would need to duplicate these fields. The envelope standardizes it.
+
+### Dead Letter Topics (DLT)
+
+When a consumer fails to process a message after 3 retries:
+
+```
+Message arrives → Consumer throws exception
+  → Retry 1 (after 1 second)
+  → Retry 2 (after 2 seconds)
+  → Retry 3 (after 4 seconds) — exponential backoff
+  → All retries exhausted → Message sent to .dlt topic
+  → @DltHandler logs the failure for manual investigation
+```
+
+This prevents a single bad message from blocking the entire topic. The DLT acts as a quarantine — you can inspect and replay messages later.
+
+### The Payment Module
+
+| Component | Purpose |
+|-----------|---------|
+| `Payment` entity | Maps to `payments` table. Tracks: bookingId, amount, status, gateway transaction ID |
+| `PaymentStatus` enum | INITIATED → PROCESSING → SUCCESS / FAILED / REFUNDED |
+| `MockPaymentGateway` | Simulates a real payment gateway. 90% success, 10% failure. 50-200ms delay. |
+| `PaymentService` | Orchestrator: idempotency → create payment → call gateway → publish Kafka event |
+| `PaymentEventPublisher` | Publishes `PAYMENT_SUCCESS` or `PAYMENT_FAILED` to `payment.events` |
+| `PaymentController` | REST: initiate payment, check status, retry failed payment |
+
+---
+
+## 18. The Payment Flow — End to End
+
+```
+Step 1: User creates booking
+    POST /api/v1/bookings
+    → BookingService creates booking (PAYMENT_PENDING)
+    → Publishes BOOKING_INITIATED to booking.events
+    → Returns PNR to user
+
+Step 2: User initiates payment
+    POST /api/v1/payments/initiate  { bookingId, paymentMethod }
+    → PaymentService looks up booking (pnr, amount, status)
+    → Creates Payment record (PROCESSING)
+    → Calls MockPaymentGateway
+    → Gateway returns success/failure
+
+Step 3a: Payment succeeds
+    → PaymentService updates payment to SUCCESS
+    → Publishes PAYMENT_SUCCESS to payment.events
+    → PaymentEventConsumer (in booking module) receives event:
+        • Sets booking status = CONFIRMED, sets bookedAt
+        • Evicts availability + PNR caches
+        • Publishes BOOKING_CONFIRMED to booking.events
+    → NotificationConsumer logs mock confirmation email
+
+Step 3b: Payment fails
+    → PaymentService updates payment to FAILED
+    → Publishes PAYMENT_FAILED to payment.events
+    → PaymentEventConsumer receives event:
+        • Sets booking status = FAILED
+        • Restores seat inventory (+1 available seats)
+        • Releases Redis seat lock
+        • Evicts caches
+        • Publishes BOOKING_FAILED to booking.events
+    → NotificationConsumer logs mock failure notification
+    → User can retry: POST /api/v1/payments/{paymentId}/retry
+```
+
+### Idempotency in the Payment Flow
+
+**The problem:** What if `PAYMENT_SUCCESS` is delivered twice (Kafka's at-least-once semantics)?
+
+**Our solution:** The `PaymentEventConsumer` checks the current booking status before processing:
+
+```java
+if (booking.getBookingStatus() == BookingStatus.CONFIRMED) {
+    log.info("Already confirmed, skipping duplicate event");
+    return;  // Safe to ignore
+}
+```
+
+This makes the consumer **idempotent** — processing the same event multiple times has no additional effect.
+
+---
+
+## 19. What's Coming Next
 
 | Phase | What | Key Concept You'll Learn |
 |-------|------|-------------------------|
-| **Phase 3** (Week 5-6) | Payments + Kafka | **Event-driven architecture** — booking confirmation happens asynchronously via events. **Exactly-once delivery** — payments must never be processed twice. |
 | **Phase 4** (Week 7-8) | Elasticsearch + CQRS | **CQRS pattern** — writes go to PostgreSQL, reads come from Elasticsearch. **Eventual consistency** — the search index lags behind by milliseconds. |
 | **Phase 5** (Week 9-10) | Waitlist, cancellations, notifications | **Event choreography** — one cancellation triggers: refund + waitlist promotion + notification, all via events. |
 | **Phase 6** (Week 11-12) | Testing, observability, resilience | **Integration tests** — test with real PostgreSQL/Redis/Kafka in Docker. **Circuit breaker** — gracefully handle payment gateway outages. |
 
 ---
 
-## 18. File Reference Guide
+## 20. File Reference Guide
 
 Quick reference to find any file:
 
 ```
 docs/ARCHITECTURE.md                                    ← THIS FILE
+docs/LEARNINGS.md                                       ← Technologies & concepts guide
 
 pom.xml                                                 ← Parent Maven POM
-docker/docker-compose.yml                               ← PostgreSQL + Redis containers
+docker/docker-compose.yml                               ← PostgreSQL + Redis + Kafka + ZK + Kafka UI
 
 railway-common/src/main/java/com/railway/common/
 ├── dto/ErrorResponse.java                              ← API error format
 ├── dto/PagedResponse.java                              ← Pagination wrapper
 ├── entity/BaseEntity.java                              ← JPA auditing (createdAt/updatedAt)
-├── event/EventEnvelope.java                            ← Kafka event wrapper
+├── event/
+│   ├── EventEnvelope.java                              ← Generic Kafka event wrapper
+│   ├── BookingEvent.java                               ← Booking event payload
+│   └── PaymentEvent.java                               ← Payment event payload
 └── exception/
     ├── BusinessException.java                          ← Base exception
     ├── ResourceNotFoundException.java                  ← 404 errors
@@ -1214,8 +1381,11 @@ railway-booking/src/main/java/com/railway/booking/
 │   ├── AvailabilityCache.java                          ← Write-through availability cache
 │   ├── PnrCache.java                                   ← Cache-aside PNR lookup
 │   └── IdempotencyStore.java                           ← Duplicate request prevention
+├── kafka/
+│   ├── BookingEventPublisher.java                      ← Publishes booking lifecycle events
+│   └── PaymentEventConsumer.java                       ← Consumes payment events → confirms/fails bookings
 ├── service/
-│   ├── BookingService.java                             ← THE ORCHESTRATOR: lock→book→cache
+│   ├── BookingService.java                             ← THE ORCHESTRATOR: lock→book→cache→publish
 │   ├── SeatAvailabilityService.java                    ← Redis-first availability check
 │   ├── PnrStatusService.java                           ← Redis-first PNR lookup
 │   ├── TrainRunService.java                            ← Schedule → TrainRun materialization
@@ -1236,12 +1406,29 @@ railway-booking/src/main/java/com/railway/booking/
     ├── PnrStatusResponse.java                          ← PNR + passenger statuses
     └── GenerateTrainRunsRequest.java                   ← Admin: trainId + date range
 
+railway-payment/src/main/java/com/railway/payment/
+├── entity/
+│   ├── Payment.java                                    ← Payment JPA entity
+│   └── PaymentStatus.java                              ← Enum: INITIATED → SUCCESS / FAILED
+├── repository/PaymentRepository.java                   ← findByBookingId, findByPnr
+├── gateway/MockPaymentGateway.java                     ← Simulates payment gateway (90% success)
+├── kafka/PaymentEventPublisher.java                    ← Publishes PAYMENT_SUCCESS/FAILED
+├── service/PaymentService.java                         ← Payment orchestrator
+├── controller/PaymentController.java                   ← /api/v1/payments/*
+└── dto/
+    ├── PaymentRequest.java                             ← bookingId + paymentMethod
+    └── PaymentResponse.java                            ← Payment status + gateway info
+
+railway-notification/src/main/java/com/railway/notification/
+└── kafka/NotificationConsumer.java                     ← Logs mock email/SMS on booking events
+
 railway-app/src/main/java/com/railway/app/
 ├── RailwayApplication.java                             ← Main class
 └── config/
     ├── SecurityConfig.java                             ← URL access rules, JWT filter
-    ├── SwaggerConfig.java                              ← API documentation
-    └── RedisConfig.java                                ← Redis JSON serialization config
+    ├── SwaggerConfig.java                              ← API documentation (Swagger UI)
+    ├── RedisConfig.java                                ← Redis JSON serialization config
+    └── KafkaConfig.java                                ← Topic creation (6 topics)
 
 railway-app/src/main/resources/
 ├── application.yml                                     ← All configuration
@@ -1250,7 +1437,8 @@ railway-app/src/main/resources/
     ├── V2__create_stations_trains.sql                  ← Stations + Trains tables
     ├── V3__create_routes_schedules.sql                 ← Routes, RouteStations, Schedules, TrainRuns
     ├── V4__create_coaches_seats.sql                    ← Coaches + SeatInventory tables
-    └── V5__create_bookings.sql                         ← Bookings, Passengers, SeatAllocations
+    ├── V5__create_bookings.sql                         ← Bookings, Passengers, SeatAllocations
+    └── V6__create_payments.sql                         ← Payments table
 ```
 
 ---
@@ -1258,23 +1446,27 @@ railway-app/src/main/resources/
 ## How to Run
 
 ```bash
-# 1. Start PostgreSQL + Redis
+# 1. Start all infrastructure (PostgreSQL + Redis + Kafka + Zookeeper + Kafka UI)
 docker compose -f docker/docker-compose.yml up -d
 
-# 2. Build the project
-mvn clean package
+# 2. Verify all services are healthy
+docker compose -f docker/docker-compose.yml ps
 
-# 3. Run the application
+# 3. Build the project
+mvn clean package -DskipTests
+
+# 4. Run the application
 mvn spring-boot:run -pl railway-app
 
-# 4. Open Swagger UI
+# 5. Open Swagger UI — test ALL APIs from the browser
 # http://localhost:8080/swagger-ui.html
 
-# 5. Test: Register a user
-curl -X POST http://localhost:8080/api/v1/auth/register \
-  -H "Content-Type: application/json" \
-  -d '{"email":"test@example.com","password":"secret123","fullName":"Test User"}'
+# 6. Open Kafka UI — see topics and messages
+# http://localhost:8090
 
-# 6. Check Redis keys (after some bookings)
+# 7. Check Redis keys
 docker exec -it railway-redis redis-cli KEYS '*'
+
+# 8. Connect to PostgreSQL
+docker exec -it railway-postgres psql -U railway railway_booking
 ```
