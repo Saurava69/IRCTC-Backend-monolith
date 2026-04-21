@@ -3,6 +3,7 @@ package com.railway.booking.service;
 import com.railway.booking.dto.BookingRequest;
 import com.railway.booking.dto.BookingResponse;
 import com.railway.booking.entity.*;
+import com.railway.booking.kafka.BookingEventPublisher;
 import com.railway.booking.redis.IdempotencyStore;
 import com.railway.booking.redis.SeatLockManager;
 import com.railway.booking.repository.BookingRepository;
@@ -36,6 +37,7 @@ public class BookingService {
     private final SeatAvailabilityService availabilityService;
     private final PnrStatusService pnrStatusService;
     private final TrainRunService trainRunService;
+    private final BookingEventPublisher bookingEventPublisher;
 
     @Value("${app.booking.max-passengers-per-booking:6}")
     private int maxPassengers;
@@ -126,6 +128,8 @@ public class BookingService {
 
             availabilityService.evictCache(request.trainRunId(), request.coachType());
 
+            bookingEventPublisher.publishBookingInitiated(booking);
+
             if (request.idempotencyKey() != null) {
                 idempotencyStore.markCompleted(request.idempotencyKey(), booking.getPnr());
             }
@@ -175,6 +179,7 @@ public class BookingService {
 
             availabilityService.evictCache(booking.getTrainRunId(), booking.getCoachType());
             pnrStatusService.evictCache(booking.getPnr());
+            bookingEventPublisher.publishBookingFailed(booking);
 
             log.info("Expired booking: PNR={}", booking.getPnr());
         }
