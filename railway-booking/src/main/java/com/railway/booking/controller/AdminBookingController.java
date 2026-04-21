@@ -7,6 +7,7 @@ import jakarta.persistence.EntityManager;
 import jakarta.persistence.PersistenceContext;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.web.bind.annotation.*;
@@ -18,6 +19,7 @@ import java.util.Map;
 @RestController
 @RequestMapping("/api/v1/admin")
 @RequiredArgsConstructor
+@Slf4j
 public class AdminBookingController {
 
     private final TrainRunService trainRunService;
@@ -58,14 +60,14 @@ public class AdminBookingController {
             }
 
             @SuppressWarnings("unchecked")
-            List<Object[]> routeStations = entityManager.createNativeQuery(
+            List<Number> routeStations = entityManager.createNativeQuery(
                     "SELECT rs.station_id FROM route_stations rs " +
                     "WHERE rs.route_id = :routeId ORDER BY rs.sequence_number"
             ).setParameter("routeId", routeId).getResultList();
 
             List<TrainRunService.SegmentInfo> segments = new ArrayList<>();
             List<Long> stationIds = routeStations.stream()
-                    .map(r -> ((Number) r[0]).longValue()).toList();
+                    .map(Number::longValue).toList();
 
             for (Object[] coach : coachData) {
                 String coachType = (String) coach[0];

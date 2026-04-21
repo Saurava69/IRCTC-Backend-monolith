@@ -70,6 +70,7 @@ public class PaymentEventConsumer {
 
         booking.setBookingStatus(BookingStatus.CONFIRMED);
         booking.setBookedAt(Instant.now());
+        booking.getPassengers().forEach(p -> p.setStatus(BookingStatus.CONFIRMED));
         bookingRepository.save(booking);
 
         availabilityService.evictCache(booking.getTrainRunId(), booking.getCoachType());
@@ -93,6 +94,7 @@ public class PaymentEventConsumer {
         }
 
         booking.setBookingStatus(BookingStatus.FAILED);
+        booking.getPassengers().forEach(p -> p.setStatus(BookingStatus.FAILED));
         bookingRepository.save(booking);
 
         seatInventoryRepository.findBySegment(

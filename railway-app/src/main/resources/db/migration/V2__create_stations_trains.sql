@@ -5,8 +5,8 @@ CREATE TABLE stations (
     city            VARCHAR(100),
     state           VARCHAR(100),
     zone            VARCHAR(50),
-    latitude        DECIMAL(10, 7),
-    longitude       DECIMAL(10, 7),
+    latitude        DOUBLE PRECISION,
+    longitude       DOUBLE PRECISION,
     is_active       BOOLEAN DEFAULT TRUE,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );

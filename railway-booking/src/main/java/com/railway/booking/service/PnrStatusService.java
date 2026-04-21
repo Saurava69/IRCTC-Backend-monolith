@@ -8,6 +8,7 @@ import com.railway.common.exception.ResourceNotFoundException;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 
 import java.util.Optional;
 
@@ -19,6 +20,7 @@ public class PnrStatusService {
     private final BookingRepository bookingRepository;
     private final PnrCache pnrCache;
 
+    @Transactional(readOnly = true)
     public PnrStatusResponse getStatus(String pnr) {
         Optional<PnrStatusResponse> cached = pnrCache.get(pnr);
         if (cached.isPresent()) {

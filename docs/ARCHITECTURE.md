@@ -43,8 +43,8 @@ We're building a **railway ticket booking backend** similar to IRCTC. The goal i
                     │    ├── User Module (auth, profiles)              │
                     │    ├── Train Module (stations, routes, coaches)  │
                     │    ├── Booking Module (seat lock, PNR)      [P2] │
-                    │    ├── Payment Module (pay, refund)         [P3] │
-                    │    └── Notification Module (email/SMS)      [P5] │
+                    │    ├── Payment Module (pay, retry)          [P3] │
+                    │    └── Notification Module (Kafka consumer) [P3] │
                     │                                                  │
                     ├──────────── Talks To ────────────────────────────┤
                     │                                                  │
@@ -53,11 +53,15 @@ We're building a **railway ticket booking backend** similar to IRCTC. The goal i
                     │  Kafka ────────── Event streaming           [P3] │
                     │  Elasticsearch ── Search & read model       [P4] │
                     │                                                  │
-                    │  [P1] = Phase 1 (done), [P2-P6] = coming next   │
+                    │  [P1] = Phase 1, [P2] = Phase 2, [P3] = Phase 3 │
                     └──────────────────────────────────────────────────┘
 ```
 
-**Phase 1 (current)** sets up the foundation: project structure, database schema, authentication, and CRUD APIs for users/trains/stations/routes.
+**Phase 1 (foundation)** sets up the foundation: project structure, database schema, authentication, and CRUD APIs for users/trains/stations/routes.
+
+**Phase 2 (booking + Redis)** adds the booking engine, seat availability, distributed locking, caching, rate limiting, and idempotency.
+
+**Phase 3 (payments + Kafka)** introduces event-driven architecture with Kafka and a mock payment gateway. The system becomes truly async — booking, payment, and notification modules communicate via events.
 
 ---
 
@@ -173,7 +177,8 @@ railwayTicketBooking/
 
 **Rules:**
 - Every module depends on `railway-common` (for shared DTOs, exceptions, events)
-- **NO module depends on another module directly** (no `railway-booking` → `railway-train`)
+- `railway-booking` also depends on `railway-user` (for JWT authentication principal)
+- Other modules do NOT cross-depend — `railway-payment` reads the `bookings` table via native SQL, not by importing booking classes
 - Only `railway-app` depends on all modules (it's the assembly point)
 - Cross-module communication happens through **Kafka events** (Phase 3)
 
@@ -796,9 +801,29 @@ Database connections are expensive to create (~50-100ms). A connection pool main
 | `PnrController.java` | `GET /pnr/{pnr}` (20/min limit) |
 | `AdminBookingController.java` | `POST /admin/train-runs/generate` (admin only) |
 
-### railway-payment, railway-notification
+### railway-payment
 
-**Purpose**: Stubs for now. Each has only a `@Configuration` class so Maven can build them. Real implementation comes in Phases 3 and 5.
+**Purpose**: Payment processing with mock gateway and Kafka event publishing.
+
+| File | What it does |
+|------|-------------|
+| `entity/Payment.java` | JPA entity → `payments` table. Tracks booking, amount, status, gateway transaction |
+| `entity/PaymentStatus.java` | Enum: INITIATED, PROCESSING, SUCCESS, FAILED, REFUNDED |
+| `repository/PaymentRepository.java` | findByBookingId, findByPnr, findByIdempotencyKey |
+| `gateway/MockPaymentGateway.java` | Simulates payment gateway: 90% success, 50-200ms delay, random failure reasons |
+| `kafka/PaymentEventPublisher.java` | Publishes PAYMENT_SUCCESS/FAILED to `payment.events` topic |
+| `service/PaymentService.java` | Orchestrator: idempotency → lookup booking → create payment → call gateway → publish event |
+| `controller/PaymentController.java` | `POST /payments/initiate`, `GET /payments/booking/{id}`, `POST /payments/{id}/retry` |
+| `dto/PaymentRequest.java` | bookingId + paymentMethod + optional idempotencyKey |
+| `dto/PaymentResponse.java` | Full payment details including gateway transaction ID |
+
+### railway-notification
+
+**Purpose**: Consumes booking lifecycle events via Kafka and logs mock notifications (email/SMS implementation in Phase 5).
+
+| File | What it does |
+|------|-------------|
+| `kafka/NotificationConsumer.java` | Listens on `booking.events` topic. Logs mock notifications for BOOKING_INITIATED, CONFIRMED, FAILED |
 
 ### railway-app
 

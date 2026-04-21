@@ -29,8 +29,9 @@
 20. [Lombok](#20-lombok)
 21. [Apache Kafka & Event-Driven Architecture](#21-apache-kafka--event-driven-architecture)
 22. [Payment Processing Patterns](#22-payment-processing-patterns)
-23. [What's Coming — Elasticsearch, CQRS, Waitlist](#23-whats-coming--elasticsearch-cqrs-waitlist)
-24. [Learning Resources](#24-learning-resources)
+23. [Real Bugs We Hit & Fixed (Phase 1-3)](#23-real-bugs-we-hit--fixed-phase-1-3)
+24. [What's Coming — Elasticsearch, CQRS, Waitlist](#24-whats-coming--elasticsearch-cqrs-waitlist)
+25. [Learning Resources](#25-learning-resources)
 
 ---
 
@@ -1650,7 +1651,107 @@ POST /api/v1/payments/{paymentId}/retry
 
 ---
 
-## 23. What's Coming — Elasticsearch, CQRS, Waitlist
+## 23. Real Bugs We Hit & Fixed (Phase 1-3)
+
+These are actual bugs encountered during development. Each one teaches a distributed systems or JPA lesson you won't find in tutorials.
+
+### Bug 1: Hibernate Schema Validation — Type Mismatch
+
+**Symptom:** App failed to start with `Schema-validation: wrong column type encountered in column [latitude]`
+
+**Root cause:** The Flyway migration used `DECIMAL(10,7)` for latitude/longitude, but the Java entity used `Double`. Hibernate 6.4 maps `Double` to `float(53)` (PostgreSQL `double precision`), not `numeric`.
+
+**Fix:** Changed migration to `DOUBLE PRECISION` to match what Hibernate expects for Java `Double`.
+
+**Lesson:** `ddl-auto: validate` catches mismatches between your entities and your migrations. Always check that your SQL types map correctly to your Java types. Hibernate's type mapping changed between versions — what worked in Hibernate 5 may break in 6.
+
+### Bug 2: Native Query Single-Column Cast — ClassCastException
+
+**Symptom:** `POST /admin/train-runs/generate` returned 500.
+
+**Root cause:** The native query `SELECT rs.station_id FROM route_stations` returns a **single column**. JPA returns each row as a plain `Number` object, NOT an `Object[]`. But the code cast it as `((Number) r[0]).longValue()` — treating `r` as an array when it's a scalar.
+
+**Fix:** Changed `List<Object[]>` to `List<Number>` and `.map(Number::longValue)`.
+
+**Lesson:** JPA native queries return `Object[]` only when selecting **multiple columns**. Single-column results come back as the raw type. This is a common trap when refactoring queries.
+
+### Bug 3: LazyInitializationException — Accessing Relations Outside Transaction
+
+**Symptom:** `GET /bookings/{pnr}` returned 500 with `LazyInitializationException: could not initialize proxy - no Session`.
+
+**Root cause:** The `Booking` entity has `@OneToMany passengers` with default `FetchType.LAZY`. The `getBookingByPnr()` service method wasn't `@Transactional`. When `toResponse()` called `booking.getPassengers().stream()`, the Hibernate session was already closed.
+
+**Why `@Transactional(readOnly = true)` didn't fix it:** The `@Transactional` annotation was added but still failed — because the `findByPnr` repository method ran in its own transaction (Spring Data auto-transaction), returned a detached entity, and the service-level transaction proxy wasn't properly wrapping the call.
+
+**Fix:** Changed `@OneToMany` to `fetch = FetchType.EAGER`. For a booking with max 6 passengers, eager loading is perfectly acceptable — no N+1 concern.
+
+**Alternative fix:** Use `@Query("SELECT b FROM Booking b LEFT JOIN FETCH b.passengers WHERE b.pnr = :pnr")` in the repository to eagerly load in a single query.
+
+**Lesson:** `open-in-view: false` (which we correctly set) means you MUST load all data within a transaction. Lazy loading silently works with `open-in-view: true` but breaks in production under load. This bug is the #1 JPA gotcha for beginners. Options:
+1. `FetchType.EAGER` — simple, fine for small collections (≤6 items)
+2. `JOIN FETCH` in JPQL — explicit, best for large/optional collections
+3. `@EntityGraph` — declarative, good for multiple associations
+4. `@Transactional` on the service method — keeps session open, but risks N+1
+
+### Bug 4: Kafka Listener Dual-Listener Configuration
+
+**Symptom:** Kafka UI showed cluster as "Offline" even though Kafka was running and the Spring Boot app could produce/consume messages.
+
+**Root cause:** Kafka was configured with a single advertised listener: `PLAINTEXT://localhost:9092`. The Spring Boot app (running on the host) could reach `localhost:9092`. But Kafka UI (running inside Docker) couldn't — `localhost` inside a container refers to the container itself, not the host.
+
+**Fix:** Configured two listeners:
+```yaml
+KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT
+KAFKA_LISTENERS: INTERNAL://0.0.0.0:29092,EXTERNAL://0.0.0.0:9092
+KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:29092,EXTERNAL://localhost:9092
+KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+```
+- `INTERNAL://kafka:29092` — for Docker-to-Docker traffic (Kafka UI, Zookeeper)
+- `EXTERNAL://localhost:9092` — for host-to-Docker traffic (Spring Boot app)
+
+Kafka UI updated to use `kafka:29092` as bootstrap server.
+
+**Lesson:** Kafka's `ADVERTISED_LISTENERS` is one of the most common Kafka configuration pitfalls. The advertised address is what Kafka tells clients to connect to — it must be reachable FROM the client. When clients are in different network contexts (host vs Docker), you need multiple listeners.
+
+### Bug 5: Passenger Status Not Updating on Payment
+
+**Symptom:** After successful payment, `bookingStatus` showed `CONFIRMED` but each passenger's `status` still showed `PAYMENT_PENDING`.
+
+**Root cause:** The `PaymentEventConsumer.handlePaymentSuccess()` method updated `booking.setBookingStatus(CONFIRMED)` but never iterated through passengers to update their individual statuses.
+
+**Fix:** Added `booking.getPassengers().forEach(p -> p.setStatus(BookingStatus.CONFIRMED))` before saving. Same fix for the failure path.
+
+**Lesson:** When a parent entity's state changes, think about whether child entities need to follow. In a booking system, the passenger status is user-facing — it must stay in sync with the booking status. This is a domain modeling concern, not a technical one.
+
+### Bug 6: Stale Compiled JARs in Multi-Module Build
+
+**Symptom:** Code changes (like the passenger status fix above) appeared to have no effect after recompile.
+
+**Root cause:** `mvn compile` compiles source files but may use cached JARs from the local Maven repository for inter-module dependencies. The `railway-app` module depends on `railway-booking` JAR — if the JAR wasn't reinstalled, the old code runs.
+
+**Fix:** Use `mvn clean spring-boot:run -pl railway-app` — the `clean` phase deletes all compiled artifacts, forcing a full rebuild.
+
+**Lesson:** In multi-module Maven projects, always use `mvn clean` when debugging issues where code changes don't take effect. For faster iteration, use `mvn clean compile && mvn spring-boot:run -pl railway-app`.
+
+### Bug 7: Swallowed Exceptions in GlobalExceptionHandler
+
+**Symptom:** API returned `{"code":"INTERNAL_ERROR","message":"An unexpected error occurred"}` with no stack trace in the console.
+
+**Root cause:** The catch-all exception handler returned a generic 500 without logging the actual exception:
+```java
+@ExceptionHandler(Exception.class)
+public ResponseEntity<ErrorResponse> handleGeneral(Exception ex) {
+    return buildResponse(HttpStatus.INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", "An unexpected error occurred");
+}
+```
+
+**Fix:** Added `log.error("Unhandled exception", ex)` to log the full stack trace before returning the generic response.
+
+**Lesson:** NEVER swallow exceptions in a catch-all handler. The generic response to the client is correct (don't expose internals), but you MUST log the full exception server-side. Without it, debugging production issues is impossible.
+
+---
+
+## 24. What's Coming — Elasticsearch, CQRS, Waitlist
 
 ### Phase 4: Elasticsearch (CQRS)
 
@@ -1674,7 +1775,7 @@ Testcontainers (integration tests with real Docker containers), circuit breakers
 
 ---
 
-## 24. Learning Resources
+## 25. Learning Resources
 
 ### Books (Highly Recommended)
 

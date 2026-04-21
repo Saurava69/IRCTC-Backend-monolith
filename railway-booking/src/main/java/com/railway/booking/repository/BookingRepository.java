@@ -13,12 +13,16 @@ import java.util.Optional;
 
 public interface BookingRepository extends JpaRepository<Booking, Long> {
 
+    @Query("SELECT b FROM Booking b LEFT JOIN FETCH b.passengers WHERE b.pnr = :pnr")
     Optional<Booking> findByPnr(String pnr);
 
     Optional<Booking> findByIdempotencyKey(String idempotencyKey);
 
+    @Query("SELECT b FROM Booking b LEFT JOIN FETCH b.passengers WHERE b.userId = :userId ORDER BY b.createdAt DESC")
+    List<Booking> findAllByUserId(Long userId);
+
     Page<Booking> findByUserIdOrderByCreatedAtDesc(Long userId, Pageable pageable);
 
-    @Query("SELECT b FROM Booking b WHERE b.bookingStatus = :status AND b.createdAt < :cutoff")
+    @Query("SELECT b FROM Booking b LEFT JOIN FETCH b.passengers WHERE b.bookingStatus = :status AND b.createdAt < :cutoff")
     List<Booking> findExpiredBookings(BookingStatus status, Instant cutoff);
 }

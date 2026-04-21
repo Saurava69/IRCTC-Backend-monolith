@@ -59,7 +59,7 @@ public class Booking extends BaseEntity {
     @Version
     private Long version;
 
-    @OneToMany(mappedBy = "booking", cascade = CascadeType.ALL, orphanRemoval = true)
+    @OneToMany(mappedBy = "booking", cascade = CascadeType.ALL, orphanRemoval = true, fetch = FetchType.EAGER)
     @Builder.Default
     private List<BookingPassenger> passengers = new ArrayList<>();
 }

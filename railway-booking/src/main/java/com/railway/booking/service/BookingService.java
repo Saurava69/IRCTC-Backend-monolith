@@ -147,12 +147,14 @@ public class BookingService {
         }
     }
 
+    @Transactional(readOnly = true)
     public BookingResponse getBookingByPnr(String pnr) {
         Booking booking = bookingRepository.findByPnr(pnr)
                 .orElseThrow(() -> new ResourceNotFoundException("Booking", pnr));
         return toResponse(booking);
     }
 
+    @Transactional(readOnly = true)
     public Page<BookingResponse> getUserBookings(Long userId, Pageable pageable) {
         return bookingRepository.findByUserIdOrderByCreatedAtDesc(userId, pageable)
                 .map(this::toResponse);
