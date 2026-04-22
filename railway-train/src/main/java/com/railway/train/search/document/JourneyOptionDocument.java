@@ -28,6 +28,7 @@ public class JourneyOptionDocument {
     private String trainName;
     private String trainType;
 
+    @Field(type = FieldType.Date, format = DateFormat.date)
     private LocalDate runDate;
     private Long fromStationId;
     private String fromStationCode;
