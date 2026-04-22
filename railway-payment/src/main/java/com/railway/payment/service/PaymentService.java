@@ -46,9 +46,9 @@ public class PaymentService {
         BigDecimal amount = (BigDecimal) booking[1];
         String status = (String) booking[2];
 
-        if (!"PAYMENT_PENDING".equals(status)) {
+        if (!"PAYMENT_PENDING".equals(status) && !"RAC".equals(status) && !"WAITLISTED".equals(status)) {
             throw new BusinessException("INVALID_BOOKING_STATUS",
-                    "Booking is not in PAYMENT_PENDING status. Current: " + status);
+                    "Booking is not in a payable status. Current: " + status);
         }
 
         List<Payment> existingPayments = paymentRepository.findByBookingId(bookingId);
@@ -109,6 +109,42 @@ public class PaymentService {
         }
 
         return initiatePayment(original.getBookingId(), original.getPaymentMethod(), null);
+    }
+
+    @Transactional
+    public void initiateRefund(Long bookingId) {
+        List<Payment> payments = paymentRepository.findByBookingId(bookingId);
+        java.util.Optional<Payment> successfulPayment = payments.stream()
+                .filter(p -> p.getPaymentStatus() == PaymentStatus.SUCCESS)
+                .findFirst();
+
+        if (successfulPayment.isEmpty()) {
+            log.info("No successful payment found for booking {}, skipping refund", bookingId);
+            return;
+        }
+
+        Payment payment = successfulPayment.get();
+
+        if (payment.getPaymentStatus() == PaymentStatus.REFUNDED) {
+            log.info("Payment {} already refunded for booking {}", payment.getId(), bookingId);
+            return;
+        }
+
+        MockPaymentGateway.GatewayResponse refundResponse =
+                paymentGateway.processRefund(bookingId, payment.getAmount());
+
+        payment.setRefundTransactionId(refundResponse.transactionId());
+
+        if (refundResponse.success()) {
+            payment.setPaymentStatus(PaymentStatus.REFUNDED);
+            payment = paymentRepository.save(payment);
+            eventPublisher.publishPaymentRefunded(payment);
+            log.info("Refund SUCCESS for booking {}, refundTxn={}", bookingId, refundResponse.transactionId());
+        } else {
+            paymentRepository.save(payment);
+            log.error("Refund FAILED for booking {}: {}", bookingId, refundResponse.failureReason());
+            throw new RuntimeException("Refund failed for booking " + bookingId + ": " + refundResponse.failureReason());
+        }
     }
 
     @SuppressWarnings("unchecked")

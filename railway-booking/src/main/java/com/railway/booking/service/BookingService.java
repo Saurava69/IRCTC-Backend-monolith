@@ -93,7 +93,24 @@ public class BookingService {
                             "Seats were booked by another user. Please try again.");
                 }
             } else {
-                status = BookingStatus.PAYMENT_PENDING;
+                int racCapacity = (int) Math.ceil(inventory.getTotalSeats() * 0.10);
+                if (inventory.getRacSeats() + passengerCount <= racCapacity) {
+                    status = BookingStatus.RAC;
+                    int updated = seatInventoryRepository.incrementRacSeats(
+                            inventory.getId(), passengerCount, inventory.getVersion());
+                    if (updated == 0) {
+                        throw new BusinessException("CONCURRENT_BOOKING",
+                                "RAC slots taken, please retry");
+                    }
+                } else {
+                    status = BookingStatus.WAITLISTED;
+                    int updated = seatInventoryRepository.incrementWaitlistCount(
+                            inventory.getId(), passengerCount, inventory.getVersion());
+                    if (updated == 0) {
+                        throw new BusinessException("CONCURRENT_BOOKING",
+                                "Waitlist update conflict, please retry");
+                    }
+                }
             }
 
             String pnr = pnrGenerator.generate();
@@ -112,16 +129,23 @@ public class BookingService {
                     .idempotencyKey(request.idempotencyKey())
                     .build();
 
-            for (BookingRequest.PassengerRequest pr : request.passengers()) {
-                BookingPassenger passenger = BookingPassenger.builder()
+            for (int i = 0; i < request.passengers().size(); i++) {
+                BookingRequest.PassengerRequest pr = request.passengers().get(i);
+                BookingPassenger.BookingPassengerBuilder passengerBuilder = BookingPassenger.builder()
                         .booking(booking)
                         .name(pr.name())
                         .age(pr.age())
                         .gender(pr.gender())
                         .berthPreference(pr.berthPreference())
-                        .status(status)
-                        .build();
-                booking.getPassengers().add(passenger);
+                        .status(status);
+
+                if (status == BookingStatus.RAC) {
+                    passengerBuilder.racNumber(inventory.getRacSeats() + i + 1);
+                } else if (status == BookingStatus.WAITLISTED) {
+                    passengerBuilder.waitlistNumber(inventory.getWaitlistCount() + i + 1);
+                }
+
+                booking.getPassengers().add(passengerBuilder.build());
             }
 
             booking = bookingRepository.save(booking);

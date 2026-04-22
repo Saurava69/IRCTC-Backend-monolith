@@ -31,6 +31,25 @@ public class MockPaymentGateway {
         }
     }
 
+    public GatewayResponse processRefund(Long bookingId, java.math.BigDecimal amount) {
+        try {
+            Thread.sleep(ThreadLocalRandom.current().nextInt(30, 150));
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+
+        boolean success = ThreadLocalRandom.current().nextInt(100) < 95;
+        String transactionId = "REF-" + UUID.randomUUID().toString().substring(0, 12).toUpperCase();
+
+        if (success) {
+            log.info("Mock gateway: Refund SUCCESS for booking {} amount {}", bookingId, amount);
+            return new GatewayResponse(true, transactionId, "Refund processed successfully", null);
+        } else {
+            log.warn("Mock gateway: Refund FAILED for booking {}", bookingId);
+            return new GatewayResponse(false, transactionId, null, "Refund gateway error");
+        }
+    }
+
     public record GatewayResponse(
             boolean success,
             String transactionId,

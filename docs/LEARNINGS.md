@@ -34,8 +34,10 @@
 25. [Document Modeling & Denormalization](#25-document-modeling--denormalization)
 26. [Dependency Inversion in a Modular Monolith](#26-dependency-inversion-in-a-modular-monolith)
 27. [Real Bugs We Hit & Fixed (Phase 1-3)](#27-real-bugs-we-hit--fixed-phase-1-3)
-28. [What's Coming — Waitlist, Cancellations, Testing](#28-whats-coming--waitlist-cancellations-testing)
-29. [Learning Resources](#29-learning-resources)
+28. [Event Choreography — Cancellation Chain (Phase 5)](#28-event-choreography--cancellation-chain-phase-5)
+29. [Waitlist/RAC — Indian Railways Booking Model](#29-waitlistrac--indian-railways-booking-model)
+30. [What's Coming — Testing & Resilience](#30-whats-coming--testing--resilience)
+31. [Learning Resources](#31-learning-resources)
 
 ---
 
@@ -2125,11 +2127,67 @@ public ResponseEntity<ErrorResponse> handleGeneral(Exception ex) {
 
 ---
 
-## 28. What's Coming — Waitlist, Cancellations, Testing
+## 28. Event Choreography — Cancellation Chain (Phase 5)
 
-### Phase 5: Waitlist/RAC + Cancellations + Notifications
+### What Is Event Choreography?
 
-Event-driven choreography: one cancellation triggers a chain of events — refund processing, waitlist promotion, notification sending — all asynchronous, all decoupled.
+In **orchestration**, a central controller calls each step in sequence (saga pattern). In **choreography**, services react to events independently — no central coordinator. Each service listens, acts, and emits its own events.
+
+### Why We Chose Choreography
+
+Our cancellation triggers three independent reactions: refund, waitlist promotion, and notification. With choreography:
+
+1. **Module boundaries stay clean** — `railway-booking` doesn't depend on `railway-payment` at compile time
+2. **Each consumer has its own retry/DLT** — if the refund gateway is down, promotions still happen
+3. **Adding reactions is additive** — a future "loyalty points" consumer needs zero changes to existing code
+4. **Each consumer is idempotent** — redelivered messages don't cause duplicate actions
+
+### The Chain In Practice
+
+```
+BOOKING_CANCELLED event → booking.events topic
+  ├─ payment-refund-service group  → initiates refund → PAYMENT_REFUNDED
+  ├─ booking-waitlist-service group → promotes next passenger → BOOKING_PROMOTED
+  └─ notification-service group     → sends cancellation notification
+```
+
+Key insight: all three consumers process the **same event** from the **same topic**, but in **different consumer groups** — so each gets its own copy. This is Kafka's pub/sub model.
+
+### Idempotency In Promotion
+
+The `WaitlistPromotionConsumer` uses Redis `setIfAbsent("promotion:{eventId}", "1", 24h)` to prevent double-promotion. Without this, a consumer restart before offset commit would reprocess the event and promote two passengers instead of one.
+
+### previousStatus Pattern
+
+When the booking is already `CANCELLED` in the DB, the promotion consumer can't know what it was before. We pass `previousStatus` in the event payload — this avoids a DB round-trip and race conditions. This pattern of carrying "what was" alongside "what is" is common in event-driven systems.
+
+---
+
+## 29. Waitlist/RAC — Indian Railways Booking Model
+
+### How RAC and Waitlist Work
+
+Indian Railways has three booking tiers:
+1. **Confirmed** — you have a seat
+2. **RAC (Reservation Against Cancellation)** — you share a berth with another RAC passenger, but you're on the train
+3. **Waitlisted** — you don't have a spot yet; you're waiting for cancellations
+
+When a confirmed passenger cancels, the chain promotes:
+```
+CONFIRMED cancelled → RAC → CONFIRMED (gets full berth)
+RAC slot freed → WAITLISTED → RAC (gets shared berth)
+```
+
+### Our Implementation
+
+- `racCapacity = ceil(totalSeats × 0.10)` — 10% of total seats are RAC slots
+- RAC/WAITLISTED bookings still go through payment (you pay even for waitlisted tickets)
+- `PaymentEventConsumer` preserves RAC/WAITLISTED status on payment success (only PAYMENT_PENDING → CONFIRMED)
+- Each passenger gets `racNumber` or `waitlistNumber` for position tracking
+
+---
+
+## 30. What's Coming — Testing & Resilience
 
 ### Phase 6: Production Hardening
 
@@ -2137,7 +2195,7 @@ Testcontainers (integration tests with real Docker containers), circuit breakers
 
 ---
 
-## 29. Learning Resources
+## 31. Learning Resources
 
 ### Books (Highly Recommended)
 

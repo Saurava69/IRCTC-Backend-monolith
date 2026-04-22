@@ -13,7 +13,7 @@
       }
     },
     "trainType": { "type": "keyword" },
-    "runDate": { "type": "date", "format": "yyyy-MM-dd" },
+    "runDate": { "type": "date", "format": "yyyy-MM-dd||epoch_millis" },
     "fromStationId": { "type": "long" },
     "fromStationCode": { "type": "keyword" },
     "fromStationName": {

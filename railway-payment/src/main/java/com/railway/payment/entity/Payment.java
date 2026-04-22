@@ -47,6 +47,9 @@ public class Payment {
     @Column(name = "idempotency_key", unique = true, length = 64)
     private String idempotencyKey;
 
+    @Column(name = "refund_transaction_id", length = 100)
+    private String refundTransactionId;
+
     @Column(name = "created_at")
     private Instant createdAt;
 

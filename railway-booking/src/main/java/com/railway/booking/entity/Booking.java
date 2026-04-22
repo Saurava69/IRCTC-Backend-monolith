@@ -59,6 +59,9 @@ public class Booking extends BaseEntity {
     @Version
     private Long version;
 
+    @Column(name = "cancellation_reason")
+    private String cancellationReason;
+
     @OneToMany(mappedBy = "booking", cascade = CascadeType.ALL, orphanRemoval = true, fetch = FetchType.EAGER)
     @Builder.Default
     private List<BookingPassenger> passengers = new ArrayList<>();

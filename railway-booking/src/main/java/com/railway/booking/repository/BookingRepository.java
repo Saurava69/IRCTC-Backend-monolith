@@ -25,4 +25,12 @@ public interface BookingRepository extends JpaRepository<Booking, Long> {
 
     @Query("SELECT b FROM Booking b LEFT JOIN FETCH b.passengers WHERE b.bookingStatus = :status AND b.createdAt < :cutoff")
     List<Booking> findExpiredBookings(BookingStatus status, Instant cutoff);
+
+    @Query("SELECT b FROM Booking b LEFT JOIN FETCH b.passengers " +
+            "WHERE b.trainRunId = :trainRunId AND b.coachType = :coachType " +
+            "AND b.fromStationId = :fromStationId AND b.toStationId = :toStationId " +
+            "AND b.bookingStatus = :status ORDER BY b.createdAt ASC")
+    List<Booking> findBySegmentAndStatus(Long trainRunId, String coachType,
+                                          Long fromStationId, Long toStationId,
+                                          BookingStatus status);
 }

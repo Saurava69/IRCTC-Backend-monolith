@@ -13,5 +13,7 @@ public record BookingEvent(
         BigDecimal totalFare,
         int passengerCount,
         String status,
-        String idempotencyKey
+        String idempotencyKey,
+        String cancellationReason,
+        String previousStatus
 ) {}

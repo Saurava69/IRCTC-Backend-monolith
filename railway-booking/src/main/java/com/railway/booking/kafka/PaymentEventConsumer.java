@@ -68,9 +68,18 @@ public class PaymentEventConsumer {
             return;
         }
 
-        booking.setBookingStatus(BookingStatus.CONFIRMED);
-        booking.setBookedAt(Instant.now());
-        booking.getPassengers().forEach(p -> p.setStatus(BookingStatus.CONFIRMED));
+        BookingStatus finalStatus = switch (booking.getBookingStatus()) {
+            case PAYMENT_PENDING -> BookingStatus.CONFIRMED;
+            case RAC -> BookingStatus.RAC;
+            case WAITLISTED -> BookingStatus.WAITLISTED;
+            default -> booking.getBookingStatus();
+        };
+
+        booking.setBookingStatus(finalStatus);
+        if (finalStatus == BookingStatus.CONFIRMED) {
+            booking.setBookedAt(Instant.now());
+        }
+        booking.getPassengers().forEach(p -> p.setStatus(finalStatus));
         bookingRepository.save(booking);
 
         availabilityService.evictCache(booking.getTrainRunId(), booking.getCoachType());

@@ -2,9 +2,13 @@ package com.railway.booking.controller;
 
 import com.railway.booking.dto.BookingRequest;
 import com.railway.booking.dto.BookingResponse;
+import com.railway.booking.dto.CancellationRequest;
+import com.railway.booking.dto.CancellationResponse;
 import com.railway.booking.ratelimit.RateLimit;
 import com.railway.booking.service.BookingService;
+import com.railway.booking.service.CancellationService;
 import com.railway.common.dto.PagedResponse;
+import com.railway.user.entity.Role;
 import com.railway.user.entity.User;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
@@ -21,6 +25,7 @@ import org.springframework.web.bind.annotation.*;
 public class BookingController {
 
     private final BookingService bookingService;
+    private final CancellationService cancellationService;
 
     @PostMapping
     @RateLimit(requests = 5, windowSeconds = 60, keyPrefix = "booking")
@@ -41,5 +46,16 @@ public class BookingController {
             @AuthenticationPrincipal User user,
             @PageableDefault(size = 10) Pageable pageable) {
         return ResponseEntity.ok(PagedResponse.from(bookingService.getUserBookings(user.getId(), pageable)));
+    }
+
+    @PostMapping("/{pnr}/cancel")
+    public ResponseEntity<CancellationResponse> cancelBooking(
+            @PathVariable String pnr,
+            @RequestBody(required = false) CancellationRequest request,
+            @AuthenticationPrincipal User user) {
+        boolean isAdmin = user.getRole() == Role.ADMIN;
+        String reason = request != null ? request.cancellationReason() : null;
+        return ResponseEntity.ok(
+                cancellationService.cancelBooking(pnr, user.getId(), isAdmin, reason));
     }
 }

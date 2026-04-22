@@ -27,6 +27,10 @@ public class PaymentEventPublisher {
         publish(payment, "PAYMENT_FAILED");
     }
 
+    public void publishPaymentRefunded(Payment payment) {
+        publish(payment, "PAYMENT_REFUNDED");
+    }
+
     private void publish(Payment payment, String eventType) {
         PaymentEvent payload = new PaymentEvent(
                 payment.getId(),

@@ -26,8 +26,9 @@
 17. [Kafka & Event-Driven Architecture (Phase 3)](#17-kafka--event-driven-architecture-phase-3)
 18. [The Payment Flow — End to End](#18-the-payment-flow--end-to-end)
 19. [CQRS & Elasticsearch Search Pipeline (Phase 4)](#19-cqrs--elasticsearch-search-pipeline-phase-4)
-20. [What's Coming Next (Phase 5-6)](#20-whats-coming-next)
-21. [File Reference Guide](#21-file-reference-guide)
+20. [Cancellation, Refund & Waitlist Promotion (Phase 5)](#20-cancellation-refund--waitlist-promotion--event-choreography-phase-5)
+21. [What's Coming Next (Phase 6)](#21-whats-coming-next)
+22. [File Reference Guide](#22-file-reference-guide)
 
 ---
 
@@ -1563,16 +1564,109 @@ Users can search by station **code** (NDLS) or station **name** ("New Delhi") �
 
 ---
 
-## 20. What's Coming Next
+## 20. Cancellation, Refund & Waitlist Promotion — Event Choreography (Phase 5)
+
+Phase 5 adds the **most complex event flow** in the system: a single cancellation triggers a chain of events across three modules.
+
+### The Choreography Chain
+
+```
+POST /api/v1/bookings/{pnr}/cancel
+  └─> CancellationService (booking module)
+        ├─ DB: booking → CANCELLED, restore inventory
+        ├─ Redis: release lock, evict caches
+        └─ Kafka: BOOKING_CANCELLED → booking.events
+              ├─> BookingCancelledConsumer (payment module, group: payment-refund-service)
+              │     ├─ PaymentService.initiateRefund()
+              │     ├─ MockPaymentGateway.processRefund() — 95% success rate
+              │     └─ Kafka: PAYMENT_REFUNDED → payment.events
+              │           └─> NotificationConsumer → refund notification
+              ├─> WaitlistPromotionConsumer (booking module, group: booking-waitlist-service)
+              │     ├─ Find next RAC booking → promote to CONFIRMED
+              │     ├─ Find next WAITLISTED → promote to RAC
+              │     └─ Kafka: BOOKING_PROMOTED → booking.events
+              │           └─> NotificationConsumer → promotion notification
+              └─> NotificationConsumer → cancellation notification
+```
+
+### Why Event Choreography (Not Orchestration)
+
+In **orchestration**, a central coordinator (saga) calls each step in sequence. In **choreography**, each service reacts to events independently — there is no central controller. We chose choreography because:
+
+1. **Module boundaries stay clean** — `railway-booking` does NOT depend on `railway-payment` at compile time
+2. **Each consumer is independently deployable, retryable, and has its own DLT**
+3. **Adding new reactions is additive** — adding a "loyalty points" consumer requires zero changes to existing code
+
+### Cancellation Service — The Trigger
+
+```
+CancellationService.cancelBooking(pnr, userId, isAdmin, reason)
+├─ Authorization: only booking owner or ADMIN
+├─ Validates: only CONFIRMED, RAC, WAITLISTED can be cancelled
+├─ Captures previousStatus BEFORE transition (needed for promotion logic)
+├─ Inventory restore:
+│   ├─ CONFIRMED → incrementAvailableSeats (seat freed)
+│   ├─ RAC → decrementRacSeats (RAC slot freed)
+│   └─ WAITLISTED → decrementWaitlistCount (waitlist slot freed)
+├─ Redis: release lock (best effort), evict caches
+└─ Publishes BOOKING_CANCELLED with previousStatus in event payload
+```
+
+### Refund Flow
+
+The `BookingCancelledConsumer` in `railway-payment` listens to `booking.events`:
+- On `BOOKING_CANCELLED`: calls `PaymentService.initiateRefund(bookingId)`
+- Finds the `SUCCESS` payment, calls `MockPaymentGateway.processRefund()`
+- On success: sets payment status to `REFUNDED`, publishes `PAYMENT_REFUNDED`
+- On failure: throws (triggers `@RetryableTopic` retry, 3 attempts → DLT)
+
+### Waitlist Promotion — The Chain Reaction
+
+When a CONFIRMED booking is cancelled, the freed seat cascades:
+
+```
+CONFIRMED cancelled → availableSeats++
+  └─ Find oldest RAC booking → promote RAC → CONFIRMED (bookedAt set)
+     └─ racSeats--
+        └─ Find oldest WAITLISTED → promote WAITLISTED → RAC
+           └─ waitlistCount--
+```
+
+**Idempotency**: Uses Redis `setIfAbsent("promotion:{eventId}", "1", 24h)` to prevent double-promotion if the same BOOKING_CANCELLED event is redelivered.
+
+### RAC and Waitlist Booking
+
+The booking initiation now branches based on seat availability:
+
+```
+if availableSeats >= passengerCount:
+    → PAYMENT_PENDING (existing flow)
+elif racSeats + passengerCount <= 10% of totalSeats:
+    → RAC (passengers get racNumber)
+else:
+    → WAITLISTED (passengers get waitlistNumber)
+```
+
+RAC/WAITLISTED bookings still go through payment (consistent with Indian Railways: you pay even for waitlisted tickets). The `PaymentEventConsumer` preserves RAC/WAITLISTED status on payment success — only `PAYMENT_PENDING` becomes `CONFIRMED`.
+
+### Notification Improvements
+
+`NotificationConsumer` now:
+- Has `@RetryableTopic` with 3 retries and DLT
+- Handles `BOOKING_CANCELLED` and `BOOKING_PROMOTED` events
+- Listens to `payment.events` for `PAYMENT_REFUNDED` notifications
+
+---
+
+## 21. What's Coming Next
 
 | Phase | What | Key Concept You'll Learn |
 |-------|------|-------------------------|
-| **Phase 5** (Week 9-10) | Waitlist, cancellations, notifications | **Event choreography** — one cancellation triggers: refund + waitlist promotion + notification, all via events. |
 | **Phase 6** (Week 11-12) | Testing, observability, resilience | **Integration tests** — test with real PostgreSQL/Redis/Kafka in Docker. **Circuit breaker** — gracefully handle payment gateway outages. |
 
 ---
 
-## 21. File Reference Guide
+## 22. File Reference Guide
 
 Quick reference to find any file:
 
@@ -1644,15 +1738,15 @@ railway-train/src/main/resources/elasticsearch/
 
 railway-booking/src/main/java/com/railway/booking/
 ├── entity/
-│   ├── Booking.java                                    ← Booking JPA entity (PNR, status, @Version)
-│   ├── BookingPassenger.java                           ← Per-passenger details + seat assignment
+│   ├── Booking.java                                    ← Booking JPA entity (PNR, status, @Version, cancellationReason)
+│   ├── BookingPassenger.java                           ← Per-passenger details + seat/RAC/waitlist assignment
 │   ├── SeatInventory.java                              ← Segment-based availability (@Version)
 │   ├── TrainRun.java                                   ← Materialized train run (schedule + date)
-│   └── BookingStatus.java                              ← Enum: INITIATED → CONFIRMED / FAILED
+│   └── BookingStatus.java                              ← Enum: INITIATED → CONFIRMED / RAC / WAITLISTED / CANCELLED / FAILED
 ├── repository/
-│   ├── BookingRepository.java                          ← findByPnr, findExpired, by user
+│   ├── BookingRepository.java                          ← findByPnr, findExpired, by segment+status
 │   ├── BookingPassengerRepository.java                 ← findByBookingId
-│   ├── SeatInventoryRepository.java                    ← decrement/increment with @Version
+│   ├── SeatInventoryRepository.java                    ← decrement/increment for seats, RAC, waitlist with @Version
 │   └── TrainRunRepository.java                         ← findByTrainAndDate
 ├── redis/
 │   ├── SeatLockManager.java                            ← Distributed locking via Lua scripts
@@ -1660,13 +1754,15 @@ railway-booking/src/main/java/com/railway/booking/
 │   ├── PnrCache.java                                   ← Cache-aside PNR lookup
 │   └── IdempotencyStore.java                           ← Duplicate request prevention
 ├── kafka/
-│   ├── BookingEventPublisher.java                      ← Publishes booking lifecycle events
+│   ├── BookingEventPublisher.java                      ← Publishes booking lifecycle events (incl. CANCELLED, PROMOTED)
 │   ├── PaymentEventConsumer.java                       ← Consumes payment events → confirms/fails bookings
+│   ├── WaitlistPromotionConsumer.java                  ← [Phase 5] Promotes RAC→CONFIRMED, WAITLISTED→RAC on cancellation
 │   └── TrainRunEventPublisher.java                     ← Publishes TRAIN_RUN_CREATED → ES indexing
 ├── search/
 │   └── SearchDataProviderImpl.java                     ← Implements SearchDataProvider (cross-module)
 ├── service/
-│   ├── BookingService.java                             ← THE ORCHESTRATOR: lock→book→cache→publish
+│   ├── BookingService.java                             ← THE ORCHESTRATOR: lock→book→cache→publish (+ RAC/Waitlist paths)
+│   ├── CancellationService.java                        ← [Phase 5] Cancel booking, restore inventory, trigger event chain
 │   ├── SeatAvailabilityService.java                    ← Redis-first availability check
 │   ├── PnrStatusService.java                           ← Redis-first PNR lookup
 │   ├── TrainRunService.java                            ← Schedule → TrainRun materialization
@@ -1676,32 +1772,36 @@ railway-booking/src/main/java/com/railway/booking/
 │   ├── RateLimitInterceptor.java                       ← Redis sliding window enforcement
 │   └── BookingWebConfig.java                           ← Register interceptor on /api/v1/**
 ├── controller/
-│   ├── BookingController.java                          ← POST /bookings, GET /bookings/{pnr}
+│   ├── BookingController.java                          ← POST /bookings, GET /bookings/{pnr}, POST /bookings/{pnr}/cancel
 │   ├── AvailabilityController.java                     ← GET /availability
 │   ├── PnrController.java                              ← GET /pnr/{pnr}
 │   └── AdminBookingController.java                     ← POST /admin/train-runs/generate
 └── dto/
     ├── BookingRequest.java                             ← Booking + passengers input
     ├── BookingResponse.java                            ← Booking + passengers output
+    ├── CancellationRequest.java                        ← [Phase 5] Optional cancellation reason
+    ├── CancellationResponse.java                       ← [Phase 5] PNR, refund status, timestamp
     ├── SeatAvailabilityResponse.java                   ← Available seats for a segment
     ├── PnrStatusResponse.java                          ← PNR + passenger statuses
     └── GenerateTrainRunsRequest.java                   ← Admin: trainId + date range
 
 railway-payment/src/main/java/com/railway/payment/
 ├── entity/
-│   ├── Payment.java                                    ← Payment JPA entity
-│   └── PaymentStatus.java                              ← Enum: INITIATED → SUCCESS / FAILED
+│   ├── Payment.java                                    ← Payment JPA entity (+ refundTransactionId)
+│   └── PaymentStatus.java                              ← Enum: INITIATED → SUCCESS / FAILED / REFUNDED
 ├── repository/PaymentRepository.java                   ← findByBookingId, findByPnr
-├── gateway/MockPaymentGateway.java                     ← Simulates payment gateway (90% success)
-├── kafka/PaymentEventPublisher.java                    ← Publishes PAYMENT_SUCCESS/FAILED
-├── service/PaymentService.java                         ← Payment orchestrator
+├── gateway/MockPaymentGateway.java                     ← Simulates payment (90% success) + refund (95% success)
+├── kafka/
+│   ├── PaymentEventPublisher.java                      ← Publishes PAYMENT_SUCCESS/FAILED/REFUNDED
+│   └── BookingCancelledConsumer.java                   ← [Phase 5] Listens for BOOKING_CANCELLED → triggers refund
+├── service/PaymentService.java                         ← Payment orchestrator + initiateRefund
 ├── controller/PaymentController.java                   ← /api/v1/payments/*
 └── dto/
     ├── PaymentRequest.java                             ← bookingId + paymentMethod
     └── PaymentResponse.java                            ← Payment status + gateway info
 
 railway-notification/src/main/java/com/railway/notification/
-└── kafka/NotificationConsumer.java                     ← Logs mock email/SMS on booking events
+└── kafka/NotificationConsumer.java                     ← [Phase 5] @RetryableTopic, handles all booking + payment events
 
 railway-app/src/main/java/com/railway/app/
 ├── RailwayApplication.java                             ← Main class
@@ -1709,7 +1809,7 @@ railway-app/src/main/java/com/railway/app/
     ├── SecurityConfig.java                             ← URL access rules, JWT filter
     ├── SwaggerConfig.java                              ← API documentation (Swagger UI)
     ├── RedisConfig.java                                ← Redis JSON serialization config
-    └── KafkaConfig.java                                ← Topic creation (7 topics: booking, payment, notification, train + DLTs)
+    └── KafkaConfig.java                                ← Topic creation (8+ topics: booking, payment, notification, train + DLTs)
 
 railway-app/src/main/resources/
 ├── application.yml                                     ← All configuration (DB, JWT, Redis, Kafka, Elasticsearch)
@@ -1719,7 +1819,8 @@ railway-app/src/main/resources/
     ├── V3__create_routes_schedules.sql                 ← Routes, RouteStations, Schedules, TrainRuns
     ├── V4__create_coaches_seats.sql                    ← Coaches + SeatInventory tables
     ├── V5__create_bookings.sql                         ← Bookings, Passengers, SeatAllocations
-    └── V6__create_payments.sql                         ← Payments table
+    ├── V6__create_payments.sql                         ← Payments table
+    └── V7__cancellation_waitlist.sql                   ← [Phase 5] cancellation_reason, refund_transaction_id, indexes
 ```
 
 ---

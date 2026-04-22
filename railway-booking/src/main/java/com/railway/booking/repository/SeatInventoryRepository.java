@@ -32,4 +32,28 @@ public interface SeatInventoryRepository extends JpaRepository<SeatInventory, Lo
             "si.version = si.version + 1 " +
             "WHERE si.id = :id AND si.version = :version")
     int incrementAvailableSeats(Long id, int count, Long version);
+
+    @Modifying
+    @Query("UPDATE SeatInventory si SET si.racSeats = si.racSeats + :count, " +
+            "si.version = si.version + 1 " +
+            "WHERE si.id = :id AND si.version = :version")
+    int incrementRacSeats(Long id, int count, Long version);
+
+    @Modifying
+    @Query("UPDATE SeatInventory si SET si.racSeats = si.racSeats - :count, " +
+            "si.version = si.version + 1 " +
+            "WHERE si.id = :id AND si.racSeats >= :count AND si.version = :version")
+    int decrementRacSeats(Long id, int count, Long version);
+
+    @Modifying
+    @Query("UPDATE SeatInventory si SET si.waitlistCount = si.waitlistCount + :count, " +
+            "si.version = si.version + 1 " +
+            "WHERE si.id = :id AND si.version = :version")
+    int incrementWaitlistCount(Long id, int count, Long version);
+
+    @Modifying
+    @Query("UPDATE SeatInventory si SET si.waitlistCount = si.waitlistCount - :count, " +
+            "si.version = si.version + 1 " +
+            "WHERE si.id = :id AND si.waitlistCount >= :count AND si.version = :version")
+    int decrementWaitlistCount(Long id, int count, Long version);
 }
