@@ -54,12 +54,14 @@ public class TrainService {
         return toResponse(train);
     }
 
+    @Transactional(readOnly = true)
     public TrainResponse getByTrainNumber(String trainNumber) {
         Train train = trainRepository.findByTrainNumber(trainNumber)
                 .orElseThrow(() -> new ResourceNotFoundException("Train", trainNumber));
         return toResponse(train);
     }
 
+    @Transactional(readOnly = true)
     public List<TrainResponse> getAllActive() {
         return trainRepository.findAllActive().stream().map(this::toResponse).toList();
     }

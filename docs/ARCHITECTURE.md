@@ -27,7 +27,7 @@
 18. [The Payment Flow — End to End](#18-the-payment-flow--end-to-end)
 19. [CQRS & Elasticsearch Search Pipeline (Phase 4)](#19-cqrs--elasticsearch-search-pipeline-phase-4)
 20. [Cancellation, Refund & Waitlist Promotion (Phase 5)](#20-cancellation-refund--waitlist-promotion--event-choreography-phase-5)
-21. [What's Coming Next (Phase 6)](#21-whats-coming-next)
+21. [Scheduled Jobs (Phase 6)](#21-scheduled-jobs-phase-6)
 22. [File Reference Guide](#22-file-reference-guide)
 
 ---
@@ -1658,11 +1658,41 @@ RAC/WAITLISTED bookings still go through payment (consistent with Indian Railway
 
 ---
 
-## 21. What's Coming Next
+## 21. Scheduled Jobs (Phase 6)
 
-| Phase | What | Key Concept You'll Learn |
-|-------|------|-------------------------|
-| **Phase 6** (Week 11-12) | Testing, observability, resilience | **Integration tests** — test with real PostgreSQL/Redis/Kafka in Docker. **Circuit breaker** — gracefully handle payment gateway outages. |
+Phase 6 adds a scheduling layer using Spring's `@Scheduled` with a `ThreadPoolTaskScheduler` (4 threads).
+
+### Job Overview
+
+| Job | Schedule | Module | What It Does |
+|-----|----------|--------|-------------|
+| **BookingCleanupJob** | Every 60s | booking | Fails PAYMENT_PENDING bookings past 10-min timeout, restores seat inventory, publishes BOOKING_FAILED event |
+| **TrainRunGenerationJob** | 2:00 AM daily | booking | Auto-generates TrainRun + SeatInventory for the next 7 days using all active schedules |
+| **SearchIndexRefreshJob** | 3:30 AM daily | train | Full ES reindex as nightly safety net (Kafka handles real-time indexing) |
+| **StaleDataCleanupJob** | 4:00 AM daily | booking | Marks train runs older than 30 days as COMPLETED |
+
+### Architecture Decisions
+
+**Cross-module data access** — `TrainRunGenerationJob` (booking module) needs schedule/route/coach data from the train module. We use the **Dependency Inversion** pattern: `ScheduleDataProvider` interface in railway-common, implemented by `ScheduleDataProviderImpl` in railway-train. Same pattern as `SearchDataProvider`.
+
+**ThreadPoolTaskScheduler** — Default Spring scheduler uses a single thread. If BookingCleanupJob runs long, it would block the cron jobs. A 4-thread pool prevents this.
+
+**Idempotency** — `TrainRunGenerationJob` is idempotent via `existsByScheduleIdAndRunDate` check. Running it manually or having it fire twice is safe.
+
+**Admin trigger endpoint** — `POST /api/v1/admin/scheduler/trigger/{jobName}` lets admins manually fire any job for testing or recovery.
+
+### Key Files
+
+```
+railway-app/.../config/SchedulerConfig.java       ← ThreadPoolTaskScheduler (4 threads)
+railway-app/.../controller/AdminSchedulerController.java ← Manual trigger endpoint
+railway-booking/.../scheduler/BookingCleanupJob.java     ← Expired booking cleanup
+railway-booking/.../scheduler/TrainRunGenerationJob.java ← Auto-generate train runs
+railway-booking/.../scheduler/StaleDataCleanupJob.java   ← Mark old runs COMPLETED
+railway-common/.../scheduler/ScheduleDataProvider.java   ← Cross-module schedule data interface
+railway-train/.../scheduler/ScheduleDataProviderImpl.java ← Schedule data implementation
+railway-train/.../search/scheduler/SearchIndexRefreshJob.java ← Nightly ES reindex
+```
 
 ---
 
@@ -1688,6 +1718,8 @@ railway-common/src/main/java/com/railway/common/
 │   └── TrainRunEvent.java                              ← Train run event payload (triggers ES indexing)
 ├── search/
 │   └── SearchDataProvider.java                         ← Interface: cross-module data access (Dependency Inversion)
+├── scheduler/
+│   └── ScheduleDataProvider.java                       ← [Phase 6] Interface: schedule data for auto-generation
 └── exception/
     ├── BusinessException.java                          ← Base exception
     ├── ResourceNotFoundException.java                  ← 404 errors
@@ -1809,6 +1841,7 @@ railway-app/src/main/java/com/railway/app/
     ├── SecurityConfig.java                             ← URL access rules, JWT filter
     ├── SwaggerConfig.java                              ← API documentation (Swagger UI)
     ├── RedisConfig.java                                ← Redis JSON serialization config
+    ├── SchedulerConfig.java                            ← [Phase 6] ThreadPoolTaskScheduler (4 threads)
     └── KafkaConfig.java                                ← Topic creation (8+ topics: booking, payment, notification, train + DLTs)
 
 railway-app/src/main/resources/

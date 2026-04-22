@@ -15,12 +15,10 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
-import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.math.BigDecimal;
-import java.time.Instant;
 import java.util.List;
 import java.util.Optional;
 
@@ -41,9 +39,6 @@ public class BookingService {
 
     @Value("${app.booking.max-passengers-per-booking:6}")
     private int maxPassengers;
-
-    @Value("${app.booking.payment-timeout-seconds:600}")
-    private long paymentTimeoutSeconds;
 
     @Transactional
     public BookingResponse initiateBooking(BookingRequest request, Long userId) {
@@ -182,37 +177,6 @@ public class BookingService {
     public Page<BookingResponse> getUserBookings(Long userId, Pageable pageable) {
         return bookingRepository.findByUserIdOrderByCreatedAtDesc(userId, pageable)
                 .map(this::toResponse);
-    }
-
-    @Scheduled(fixedDelayString = "${app.booking.payment-timeout-seconds:600}000")
-    @Transactional
-    public void cleanupExpiredBookings() {
-        Instant cutoff = Instant.now().minusSeconds(paymentTimeoutSeconds);
-        List<Booking> expired = bookingRepository
-                .findExpiredBookings(BookingStatus.PAYMENT_PENDING, cutoff);
-
-        for (Booking booking : expired) {
-            booking.setBookingStatus(BookingStatus.FAILED);
-            bookingRepository.save(booking);
-
-            seatInventoryRepository.findBySegment(
-                    booking.getTrainRunId(), booking.getCoachType(),
-                    booking.getFromStationId(), booking.getToStationId()
-            ).ifPresent(inv -> {
-                seatInventoryRepository.incrementAvailableSeats(
-                        inv.getId(), booking.getPassengerCount(), inv.getVersion());
-            });
-
-            availabilityService.evictCache(booking.getTrainRunId(), booking.getCoachType());
-            pnrStatusService.evictCache(booking.getPnr());
-            bookingEventPublisher.publishBookingFailed(booking);
-
-            log.info("Expired booking: PNR={}", booking.getPnr());
-        }
-
-        if (!expired.isEmpty()) {
-            log.info("Cleaned up {} expired bookings", expired.size());
-        }
     }
 
     private void validateBookingRequest(BookingRequest request) {

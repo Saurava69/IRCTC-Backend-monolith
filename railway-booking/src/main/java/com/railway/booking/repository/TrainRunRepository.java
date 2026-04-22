@@ -2,6 +2,7 @@ package com.railway.booking.repository;
 
 import com.railway.booking.entity.TrainRun;
 import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.Query;
 
 import java.time.LocalDate;
@@ -20,4 +21,8 @@ public interface TrainRunRepository extends JpaRepository<TrainRun, Long> {
 
     @Query("SELECT tr.id FROM TrainRun tr WHERE tr.status = 'SCHEDULED'")
     List<Long> findAllActiveTrainRunIds();
+
+    @Modifying
+    @Query("UPDATE TrainRun t SET t.status = 'COMPLETED' WHERE t.runDate < :cutoff AND t.status = 'SCHEDULED'")
+    int markOldRunsCompleted(LocalDate cutoff);
 }

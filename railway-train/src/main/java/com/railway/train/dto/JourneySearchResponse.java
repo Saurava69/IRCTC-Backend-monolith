@@ -2,7 +2,6 @@ package com.railway.train.dto;
 
 import java.math.BigDecimal;
 import java.time.LocalDate;
-import java.time.LocalTime;
 import java.util.List;
 
 public record JourneySearchResponse(
@@ -14,8 +13,8 @@ public record JourneySearchResponse(
         LocalDate runDate,
         StationInfo fromStation,
         StationInfo toStation,
-        LocalTime departureTime,
-        LocalTime arrivalTime,
+        String departureTime,
+        String arrivalTime,
         Integer durationMinutes,
         Integer distanceKm,
         List<CoachAvailabilityInfo> availability,

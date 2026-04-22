@@ -49,12 +49,14 @@ public class RouteService {
         return toResponse(route);
     }
 
+    @Transactional(readOnly = true)
     public RouteResponse getById(Long id) {
         Route route = routeRepository.findByIdWithStations(id)
                 .orElseThrow(() -> new ResourceNotFoundException("Route", id));
         return toResponse(route);
     }
 
+    @Transactional(readOnly = true)
     public List<RouteResponse> getByTrainId(Long trainId) {
         return routeRepository.findByTrainId(trainId).stream().map(this::toResponse).toList();
     }

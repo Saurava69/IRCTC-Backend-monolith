@@ -52,6 +52,7 @@ public class PaymentEventConsumer {
         switch (eventType) {
             case "PAYMENT_SUCCESS" -> handlePaymentSuccess(event);
             case "PAYMENT_FAILED" -> handlePaymentFailed(event);
+            case "PAYMENT_REFUNDED" -> log.info("Payment refunded for booking {}, PNR {}", event.bookingId(), event.pnr());
             default -> log.warn("Unknown payment event type: {}", eventType);
         }
     }

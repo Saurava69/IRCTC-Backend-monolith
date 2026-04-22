@@ -79,6 +79,14 @@ app:
     availability-ttl-minutes: 5
     pnr-ttl-minutes: 15
 
+  scheduler:
+    booking-cleanup-interval-ms: 60000
+    train-run-generation-cron: "0 0 2 * * *"
+    search-reindex-cron: "0 30 3 * * *"
+    stale-cleanup-cron: "0 0 4 * * *"
+    train-run-advance-days: 7
+    stale-train-run-days: 30
+
   kafka:
     topics:
       booking-events: booking.events

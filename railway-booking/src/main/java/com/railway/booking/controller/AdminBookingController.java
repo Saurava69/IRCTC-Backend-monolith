@@ -3,6 +3,9 @@ package com.railway.booking.controller;
 import com.railway.booking.dto.GenerateTrainRunsRequest;
 import com.railway.booking.service.TrainRunService;
 import com.railway.common.exception.ResourceNotFoundException;
+import io.swagger.v3.oas.annotations.Operation;
+import io.swagger.v3.oas.annotations.responses.ApiResponse;
+import io.swagger.v3.oas.annotations.tags.Tag;
 import jakarta.persistence.EntityManager;
 import jakarta.persistence.PersistenceContext;
 import jakarta.validation.Valid;
@@ -20,6 +23,7 @@ import java.util.Map;
 @RequestMapping("/api/v1/admin")
 @RequiredArgsConstructor
 @Slf4j
+@Tag(name = "11. Admin - Bookings")
 public class AdminBookingController {
 
     private final TrainRunService trainRunService;
@@ -29,6 +33,14 @@ public class AdminBookingController {
 
     @PostMapping("/train-runs/generate")
     @PreAuthorize("hasRole('ADMIN')")
+    @Operation(summary = "Generate train runs for a date range (Admin)",
+            description = """
+                    Creates TrainRun + SeatInventory records for each day a train is scheduled to run
+                    within the given date range. This must be run before passengers can book seats.
+                    Reads schedule (days of week) and coach composition from the database.
+                    Idempotent — skips dates that already have runs.""")
+    @ApiResponse(responseCode = "200", description = "Train runs generated, count returned")
+    @ApiResponse(responseCode = "404", description = "No active schedule found for the train")
     public ResponseEntity<Map<String, Object>> generateTrainRuns(
             @Valid @RequestBody GenerateTrainRunsRequest request) {
 

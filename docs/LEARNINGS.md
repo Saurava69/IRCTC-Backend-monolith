@@ -2187,15 +2187,77 @@ RAC slot freed → WAITLISTED → RAC (gets shared berth)
 
 ---
 
-## 30. What's Coming — Testing & Resilience
+## 30. Scheduled Jobs — Spring @Scheduled & ThreadPoolTaskScheduler (Phase 6)
 
-### Phase 6: Production Hardening
+### The Problem
+
+Several operations need to run automatically:
+- Expire unpaid bookings (PAYMENT_PENDING → FAILED after 10 min)
+- Generate train runs for upcoming dates (so passengers can book ahead)
+- Keep the Elasticsearch index fresh (safety net for missed Kafka events)
+- Clean up old train runs (mark past runs as COMPLETED)
+
+### @EnableScheduling + @Scheduled
+
+Spring's scheduling is opt-in. You need `@EnableScheduling` on a config class, then `@Scheduled` on methods:
+
+```java
+@Scheduled(fixedDelayString = "${app.scheduler.booking-cleanup-interval-ms:60000}")
+public void cleanupExpiredBookings() { ... }
+
+@Scheduled(cron = "${app.scheduler.train-run-generation-cron:0 0 2 * * *}")
+public void generateUpcomingTrainRuns() { ... }
+```
+
+**fixedDelay** — runs N ms after the previous execution completes. Good for polling tasks.
+**cron** — 6-field expression: `second minute hour day-of-month month day-of-week`. Good for nightly batch jobs.
+
+### ThreadPoolTaskScheduler
+
+Default Spring scheduler uses a **single thread**. If the booking cleanup takes 5 seconds, every other scheduled job waits. We configure a thread pool:
+
+```java
+ThreadPoolTaskScheduler scheduler = new ThreadPoolTaskScheduler();
+scheduler.setPoolSize(4);
+scheduler.setWaitForTasksToCompleteOnShutdown(true);
+```
+
+4 threads = 4 jobs can run in parallel. On shutdown, it waits for running jobs to finish gracefully.
+
+### Cross-Module Data Access Pattern
+
+`TrainRunGenerationJob` (booking module) needs schedule/route/coach data from the train module. We can't add a Maven dependency from booking → train. Solution: **Dependency Inversion** (same pattern as `SearchDataProvider`):
+
+1. Define `ScheduleDataProvider` interface in `railway-common`
+2. Implement `ScheduleDataProviderImpl` in `railway-train`
+3. Inject `ScheduleDataProvider` in `TrainRunGenerationJob`
+
+Spring autowires the implementation at runtime. The booking module never imports train module classes.
+
+### Idempotency in Scheduled Jobs
+
+Train run generation is idempotent — `existsByScheduleIdAndRunDate` prevents duplicates. Safe to run manually via the admin endpoint or let the cron fire multiple times. Same for stale cleanup — `markOldRunsCompleted` is a bulk UPDATE that's naturally idempotent.
+
+### Real-World Lesson: Separate Scheduled Jobs from Service Classes
+
+Initially `cleanupExpiredBookings()` lived inside `BookingService`. Problems:
+- Service class mixes business logic with infrastructure concerns
+- Hard to test the scheduled behavior independently
+- The `@Scheduled` annotation couples the method to the scheduler lifecycle
+
+Extracting to a dedicated `BookingCleanupJob` class follows Single Responsibility Principle and makes it easy to inject into the admin trigger endpoint.
+
+---
+
+## 31. What's Coming — Testing & Resilience
+
+### Phase 7: Production Hardening
 
 Testcontainers (integration tests with real Docker containers), circuit breakers (gracefully handle downstream failures), structured logging, metrics.
 
 ---
 
-## 31. Learning Resources
+## 32. Learning Resources
 
 ### Books (Highly Recommended)
 

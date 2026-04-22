@@ -46,6 +46,7 @@ public class ScheduleService {
         return toResponse(schedule);
     }
 
+    @Transactional(readOnly = true)
     public List<ScheduleResponse> getByTrainId(Long trainId) {
         return scheduleRepository.findByTrainIdAndIsActiveTrue(trainId).stream()
                 .map(this::toResponse).toList();

@@ -7,7 +7,6 @@ import org.springframework.data.elasticsearch.annotations.*;
 import java.math.BigDecimal;
 import java.time.Instant;
 import java.time.LocalDate;
-import java.time.LocalTime;
 import java.util.List;
 
 @Document(indexName = "journey_options")
@@ -36,8 +35,8 @@ public class JourneyOptionDocument {
     private Long toStationId;
     private String toStationCode;
     private String toStationName;
-    private LocalTime departureTime;
-    private LocalTime arrivalTime;
+    private String departureTime;
+    private String arrivalTime;
     private Integer durationMinutes;
     private Integer distanceKm;
 
@@ -50,5 +49,6 @@ public class JourneyOptionDocument {
 
     private List<FareInfo> fares;
 
+    @Field(type = FieldType.Date, format = DateFormat.epoch_millis)
     private Instant lastUpdated;
 }
