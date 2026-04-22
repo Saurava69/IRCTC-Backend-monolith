@@ -2,6 +2,7 @@ package com.railway.booking.service;
 
 import com.railway.booking.entity.SeatInventory;
 import com.railway.booking.entity.TrainRun;
+import com.railway.booking.kafka.TrainRunEventPublisher;
 import com.railway.booking.repository.SeatInventoryRepository;
 import com.railway.booking.repository.TrainRunRepository;
 import com.railway.common.exception.BusinessException;
@@ -23,6 +24,7 @@ public class TrainRunService {
 
     private final TrainRunRepository trainRunRepository;
     private final SeatInventoryRepository seatInventoryRepository;
+    private final TrainRunEventPublisher trainRunEventPublisher;
 
     @Transactional
     public int generateTrainRuns(Long trainId, Long scheduleId, Long routeId,
@@ -42,6 +44,7 @@ public class TrainRunService {
             run = trainRunRepository.save(run);
 
             createSeatInventory(run.getId(), segments);
+            trainRunEventPublisher.publishTrainRunCreated(run);
             count++;
         }
 

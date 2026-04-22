@@ -25,8 +25,9 @@
 16. [The Booking Engine — How It All Fits Together](#16-the-booking-engine--how-it-all-fits-together)
 17. [Kafka & Event-Driven Architecture (Phase 3)](#17-kafka--event-driven-architecture-phase-3)
 18. [The Payment Flow — End to End](#18-the-payment-flow--end-to-end)
-19. [What's Coming Next (Phase 4-6)](#19-whats-coming-next)
-20. [File Reference Guide](#20-file-reference-guide)
+19. [CQRS & Elasticsearch Search Pipeline (Phase 4)](#19-cqrs--elasticsearch-search-pipeline-phase-4)
+20. [What's Coming Next (Phase 5-6)](#20-whats-coming-next)
+21. [File Reference Guide](#21-file-reference-guide)
 
 ---
 
@@ -62,6 +63,8 @@ We're building a **railway ticket booking backend** similar to IRCTC. The goal i
 **Phase 2 (booking + Redis)** adds the booking engine, seat availability, distributed locking, caching, rate limiting, and idempotency.
 
 **Phase 3 (payments + Kafka)** introduces event-driven architecture with Kafka and a mock payment gateway. The system becomes truly async — booking, payment, and notification modules communicate via events.
+
+**Phase 4 (search + CQRS)** adds Elasticsearch as a read-optimized store for train search. Writes stay in PostgreSQL (source of truth), Kafka events trigger an indexing pipeline that builds denormalized search documents in ES. Users get fast, full-text train search — decoupled from the write path.
 
 ---
 
@@ -729,6 +732,8 @@ Database connections are expensive to create (~50-100ms). A connection pool main
 | `ResourceNotFoundException.java` | 404 errors |
 | `DuplicateResourceException.java` | 409 conflict errors |
 | `GlobalExceptionHandler.java` | Catches all exceptions and returns consistent error JSON |
+| `TrainRunEvent.java` | Kafka event payload for train run creation (triggers ES indexing) |
+| `SearchDataProvider.java` | Interface for cross-module data access (Dependency Inversion) — implemented by railway-booking, consumed by railway-train |
 
 ### railway-user
 
@@ -767,6 +772,20 @@ Database connections are expensive to create (~50-100ms). A connection pool main
 | `StationController.java` | `GET /stations?q=del` (search), `POST /admin/stations` (create) |
 | `TrainController.java` | `GET /trains` (list), `GET /trains/{number}`, `POST /admin/trains` |
 | `RouteController.java` | `GET /routes/{id}`, `POST /admin/routes`, `POST /admin/schedules` |
+| **Search (Phase 4)** | |
+| `search/document/JourneyOptionDocument.java` | ES document: one per (trainRunId, fromStation, toStation) journey option |
+| `search/document/CoachAvailability.java` | Nested ES type: seats per coach type |
+| `search/document/FareInfo.java` | Nested ES type: fare per coach type |
+| `search/repository/JourneyOptionSearchRepository.java` | Spring Data Elasticsearch repository for `journey_options` index |
+| `search/service/JourneyDocumentBuilder.java` | Denormalization engine: builds ES documents from PostgreSQL data |
+| `search/service/TrainSearchService.java` | Queries ES for train search: station matching, coach type filtering, sorting |
+| `search/kafka/SearchIndexingConsumer.java` | Consumes train.events + booking.events → indexes/updates ES documents |
+| `controller/TrainSearchController.java` | `GET /api/v1/trains/search?from=&to=&date=&coachType=` (public) |
+| `controller/AdminSearchController.java` | `POST /api/v1/admin/search/reindex` (admin only, bulk reindex) |
+| `dto/JourneySearchResponse.java` | Search result DTO with station info, availability, fares |
+| `dto/StationSuggestionResponse.java` | Autocomplete suggestion DTO |
+| `resources/elasticsearch/journey-options-settings.json` | ES index settings: edge_ngram analyzer for autocomplete |
+| `resources/elasticsearch/journey-options-mappings.json` | ES field mappings: keyword, text, nested, scaled_float |
 
 ### railway-booking
 
@@ -800,6 +819,12 @@ Database connections are expensive to create (~50-100ms). A connection pool main
 | `AvailabilityController.java` | `GET /availability?trainRunId&coachType` (30/min limit) |
 | `PnrController.java` | `GET /pnr/{pnr}` (20/min limit) |
 | `AdminBookingController.java` | `POST /admin/train-runs/generate` (admin only) |
+| **Kafka Publishers** | |
+| `kafka/BookingEventPublisher.java` | Publishes booking lifecycle events to `booking.events` |
+| `kafka/PaymentEventConsumer.java` | Consumes payment events → confirms/fails bookings |
+| `kafka/TrainRunEventPublisher.java` | Publishes TRAIN_RUN_CREATED to `train.events` (triggers ES indexing) |
+| **Cross-Module Search Support** | |
+| `search/SearchDataProviderImpl.java` | Implements `SearchDataProvider` — provides train run info + seat inventory to railway-train's ES indexer |
 
 ### railway-payment
 
@@ -835,7 +860,8 @@ Database connections are expensive to create (~50-100ms). A connection pool main
 | `SecurityConfig.java` | URL access rules, JWT filter chain, password encoder, auth manager |
 | `SwaggerConfig.java` | OpenAPI documentation with JWT auth support |
 | `RedisConfig.java` | RedisTemplate with Jackson JSON serializer for object storage |
-| `application.yml` | All configuration: database, JWT, Redis, rate limits, cache TTLs |
+| `KafkaConfig.java` | Topic creation (7 topics: booking, payment, notification, train events + retries + DLTs) |
+| `application.yml` | All configuration: database, JWT, Redis, Kafka, Elasticsearch, rate limits, cache TTLs |
 | `V1-V5 migrations` | SQL files that create all database tables (V5 adds booking tables) |
 
 ---
@@ -1188,11 +1214,12 @@ Phase 3 introduces Apache Kafka for asynchronous, event-driven communication bet
     │                      │                      │
     ▼                      ▼                      ▼
 ┌─────────────┐   ┌──────────────┐   ┌──────────────────┐
-│ (future)    │   │ Notification │   │ (future)         │
-│ Search      │   │ Consumer     │   │ Analytics        │
-│ Indexer     │   │ (logs mock   │   │ Consumer         │
-│             │   │  email/SMS)  │   │                  │
-└─────────────┘   └──────────────┘   └──────────────────┘
+│ Search      │   │ Notification │   │ (future)         │
+│ Indexing    │   │ Consumer     │   │ Analytics        │
+│ Consumer   │   │ (logs mock   │   │ Consumer         │
+│ (updates   │   │  email/SMS)  │   │                  │
+│  ES avail) │   └──────────────┘   └──────────────────┘
+└─────────────┘
 
                     ┌──────────────────┐
                     │  payment.events  │ (3 partitions)
@@ -1208,6 +1235,20 @@ Phase 3 introduces Apache Kafka for asynchronous, event-driven communication bet
                     │  fails       │
                     │  bookings)   │
                     └──────────────┘
+
+                    ┌──────────────────┐
+                    │  train.events    │ (3 partitions)   [Phase 4]
+                    │  Topic           │
+                    └──────┬───────────┘
+                           │
+                           ▼
+                    ┌──────────────┐
+                    │ Search       │
+                    │ Indexing     │
+                    │ Consumer     │
+                    │ (builds ES  │
+                    │  documents)  │
+                    └──────────────┘
 ```
 
 ### Topics We Create
@@ -1216,6 +1257,7 @@ Phase 3 introduces Apache Kafka for asynchronous, event-driven communication bet
 |-------|-----------|-----|---------|
 | `booking.events` | 3 | trainRunId | Booking lifecycle events |
 | `payment.events` | 3 | bookingId | Payment result events |
+| `train.events` | 3 | trainId | Train run creation → triggers ES indexing |
 | `notification.events` | 3 | — | (Phase 5) notification delivery |
 | `booking.events.retry` | 1 | — | Auto-retry on processing failure |
 | `booking.events.dlt` | 1 | — | Dead letter — unprocessable messages |
@@ -1325,17 +1367,212 @@ This makes the consumer **idempotent** — processing the same event multiple ti
 
 ---
 
-## 19. What's Coming Next
+## 19. CQRS & Elasticsearch Search Pipeline (Phase 4)
+
+Phase 4 introduces the **CQRS pattern** (Command Query Responsibility Segregation) — the system now has separate write and read paths. Writes go to PostgreSQL (the source of truth). Reads for train search go to Elasticsearch (optimized for fast, full-text queries). Kafka events keep the two stores in sync.
+
+### Why separate read and write stores?
+
+| Concern | PostgreSQL (write path) | Elasticsearch (read path) |
+|---------|------------------------|--------------------------|
+| **Optimized for** | Transactional integrity, ACID | Full-text search, faceted queries |
+| **Query speed** | Slow for multi-table JOINs across trains+routes+stations+inventory | Sub-millisecond — all data denormalized into one document |
+| **Autocomplete** | `LIKE '%new del%'` — can't use index, full table scan | Edge ngram tokenizer — instant prefix matching |
+| **Schema** | Normalized (3NF) — no data duplication | Denormalized — one document has everything needed for display |
+| **Scaling** | Vertical (bigger server) | Horizontal (add more nodes, shard the index) |
+
+The tradeoff is **eventual consistency** — after a booking changes seat availability in PostgreSQL, there's a ~1-2 second lag before the ES search index reflects the change. For train search, this is perfectly acceptable.
+
+### The CQRS Architecture
+
+```
+┌─── WRITE PATH (PostgreSQL) ────────────────────────────────┐
+│  Admin API → TrainRunService → PostgreSQL                   │
+│  Booking API → BookingService → PostgreSQL                  │
+│           ↓ Kafka events                                    │
+├─── EVENT BUS (Kafka) ──────────────────────────────────────┤
+│  train.events:   TRAIN_RUN_CREATED                         │
+│  booking.events: BOOKING_CONFIRMED / BOOKING_FAILED        │
+│           ↓                                                 │
+├─── READ PATH (Elasticsearch) ──────────────────────────────┤
+│  SearchIndexingConsumer → JourneyDocumentBuilder            │
+│           → Elasticsearch (journey_options index)           │
+│  TrainSearchService ← GET /api/v1/trains/search            │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Key rule:** Writes never touch Elasticsearch directly. PostgreSQL is always the source of truth. Events are the sync mechanism. A bulk reindex endpoint (`POST /api/v1/admin/search/reindex`) is the safety net for when ES drifts out of sync.
+
+### Document Model — JourneyOptionDocument
+
+The core design decision: **one ES document per (trainRunId, fromStationId, toStationId) combination**. A train with 5 stops creates C(5,2) = 10 journey option documents.
+
+```
+Train: Delhi → Jaipur → Ahmedabad → Mumbai (3 consecutive segments)
+
+Documents created:
+  1. Delhi → Jaipur          (1 segment)
+  2. Delhi → Ahmedabad       (2 segments)
+  3. Delhi → Mumbai          (3 segments)
+  4. Jaipur → Ahmedabad      (1 segment)
+  5. Jaipur → Mumbai         (2 segments)
+  6. Ahmedabad → Mumbai      (1 segment)
+```
+
+Each document is **fully denormalized** — it contains everything needed to display a search result:
+
+```
+JourneyOptionDocument {
+    id:               "42_1_3"            // trainRunId_fromStationId_toStationId
+    trainRunId:       42
+    trainNumber:      "12301"
+    trainName:        "Rajdhani Express"
+    trainType:        "RAJDHANI"
+    runDate:          "2026-04-25"
+    fromStationCode:  "NDLS"
+    fromStationName:  "New Delhi"
+    toStationCode:    "ADI"
+    toStationName:    "Ahmedabad Junction"
+    departureTime:    "16:25"
+    arrivalTime:      "07:40"
+    durationMinutes:  915
+    distanceKm:       935
+    coachAvailabilities: [              // NESTED type in ES
+        { coachType: "FIRST_AC",  availableSeats: 42, totalSeats: 72, ... },
+        { coachType: "SLEEPER",   availableSeats: 180, totalSeats: 200, ... }
+    ]
+    fares: [
+        { coachType: "FIRST_AC",  baseFare: 3450.00 },
+        { coachType: "SLEEPER",   baseFare: 750.00 }
+    ]
+}
+```
+
+**Why denormalize?** In PostgreSQL, displaying a search result requires JOINing trains + routes + route_stations + seat_inventory + coaches. In ES, one document read returns everything. No JOINs = fast queries.
+
+**Why nested type for coachAvailabilities?** Without nested mapping, ES flattens arrays. If you have `[{type: "FIRST_AC", available: 0}, {type: "SLEEPER", available: 50}]` and search for "FIRST_AC with available > 0", ES would cross-match FIRST_AC with SLEEPER's availability and return a false positive. Nested mapping prevents this.
+
+### Elasticsearch Index Configuration
+
+The `journey_options` index uses custom analyzers for autocomplete:
+
+```
+Edge Ngram Analyzer (for station names):
+  Input:  "New Delhi"
+  Tokens: ["ne", "new", "new ", "new d", "new de", "new del", "new delh", "new delhi"]
+
+  When user types "new d" → matches "New Delhi" immediately
+```
+
+**Settings** (`journey-options-settings.json`):
+- `autocomplete_analyzer`: edge_ngram tokenizer (min=2, max=20) + lowercase filter — used at index time
+- `autocomplete_search_analyzer`: standard tokenizer + lowercase — used at search time (prevents the search query itself from being ngram-tokenized)
+
+**Mappings** (`journey-options-mappings.json`):
+- Station codes, train number → `keyword` (exact match only)
+- Station names → `text` with `autocomplete_analyzer` (prefix search)
+- Coach availabilities → `nested` (prevents cross-object matching)
+- Base fare → `scaled_float` with scaling_factor 100 (stores cents as longs, efficient for range queries)
+- Run date → `date` format
+
+### The Indexing Pipeline
+
+**1. Train run creation (Kafka-driven):**
+```
+Admin generates train runs → TrainRunService saves to PostgreSQL
+  → TrainRunEventPublisher publishes TRAIN_RUN_CREATED to train.events
+  → SearchIndexingConsumer receives event
+  → JourneyDocumentBuilder.buildDocuments(trainRunId):
+      a. Load train, route, route stations, seat inventory from PostgreSQL
+      b. For every (fromStation, toStation) pair:
+         - Calculate departure/arrival times (with dayOffset)
+         - Calculate distance from distanceFromOriginKm deltas
+         - Map seat inventory to CoachAvailability per coach type
+         - Calculate fares based on coach type
+      c. Index all documents into Elasticsearch
+```
+
+**2. Booking events (availability updates):**
+```
+Booking confirmed/failed → BookingEventPublisher publishes to booking.events
+  → SearchIndexingConsumer receives BOOKING_CONFIRMED or BOOKING_FAILED
+  → Re-queries seat_inventory from PostgreSQL
+  → Updates coachAvailabilities in existing ES documents for that trainRunId
+```
+
+**3. Bulk reindex (safety net):**
+```
+Admin → POST /api/v1/admin/search/reindex
+  → Delete all documents from journey_options index
+  → Query all active (SCHEDULED) train run IDs from PostgreSQL
+  → For each trainRunId: build all journey documents and bulk-index
+  → Return: { documentsIndexed: 1250 }
+```
+
+### Cross-Module Data Access — Dependency Inversion
+
+The `JourneyDocumentBuilder` (in `railway-train`) needs data from `railway-booking` (TrainRun, SeatInventory). But `railway-train` cannot depend on `railway-booking` — that would violate our module dependency rule.
+
+**Solution:** Dependency Inversion Principle.
+
+```
+railway-common (defines the contract):
+    SearchDataProvider interface
+        getTrainRunInfo(Long trainRunId)
+        getSegmentAvailabilities(Long trainRunId)
+        getAllActiveTrainRunIds()
+
+railway-booking (implements the contract):
+    SearchDataProviderImpl
+        @Service, delegates to TrainRunRepository + SeatInventoryRepository
+
+railway-train (consumes the contract):
+    JourneyDocumentBuilder
+        @Autowired SearchDataProvider  ← gets the booking impl at runtime
+```
+
+Both modules depend on the abstraction (in `railway-common`), not on each other. Spring's component scanning wires the concrete `SearchDataProviderImpl` at runtime. This is the same pattern used by the Java `JDBC` spec — your code depends on `java.sql.Connection`, not on `com.mysql.jdbc.ConnectionImpl`.
+
+### Search API
+
+```
+GET /api/v1/trains/search?from=NDLS&to=ADI&date=2026-04-25&coachType=SLEEPER
+
+The query builds:
+  bool:
+    must:
+      - term: runDate = "2026-04-25"
+      - bool (from station):
+          should:
+            - term: fromStationCode = "NDLS"       (exact code match)
+            - match: fromStationName = "NDLS"       (autocomplete match)
+          minimum_should_match: 1
+      - bool (to station):
+          should:
+            - term: toStationCode = "ADI"
+            - match: toStationName = "ADI"
+          minimum_should_match: 1
+    must (optional, if coachType provided):
+      - nested:
+          path: coachAvailabilities
+          query: term coachAvailabilities.coachType = "SLEEPER"
+  sort: departureTime ASC
+```
+
+Users can search by station **code** (NDLS) or station **name** ("New Delhi") — the query matches either. The `coachType` filter is optional — without it, all coach types are returned.
+
+---
+
+## 20. What's Coming Next
 
 | Phase | What | Key Concept You'll Learn |
 |-------|------|-------------------------|
-| **Phase 4** (Week 7-8) | Elasticsearch + CQRS | **CQRS pattern** — writes go to PostgreSQL, reads come from Elasticsearch. **Eventual consistency** — the search index lags behind by milliseconds. |
 | **Phase 5** (Week 9-10) | Waitlist, cancellations, notifications | **Event choreography** — one cancellation triggers: refund + waitlist promotion + notification, all via events. |
 | **Phase 6** (Week 11-12) | Testing, observability, resilience | **Integration tests** — test with real PostgreSQL/Redis/Kafka in Docker. **Circuit breaker** — gracefully handle payment gateway outages. |
 
 ---
 
-## 20. File Reference Guide
+## 21. File Reference Guide
 
 Quick reference to find any file:
 
@@ -1344,7 +1581,7 @@ docs/ARCHITECTURE.md                                    ← THIS FILE
 docs/LEARNINGS.md                                       ← Technologies & concepts guide
 
 pom.xml                                                 ← Parent Maven POM
-docker/docker-compose.yml                               ← PostgreSQL + Redis + Kafka + ZK + Kafka UI
+docker/docker-compose.yml                               ← PostgreSQL + Redis + Kafka + ZK + Kafka UI + Elasticsearch + Kibana
 
 railway-common/src/main/java/com/railway/common/
 ├── dto/ErrorResponse.java                              ← API error format
@@ -1353,7 +1590,10 @@ railway-common/src/main/java/com/railway/common/
 ├── event/
 │   ├── EventEnvelope.java                              ← Generic Kafka event wrapper
 │   ├── BookingEvent.java                               ← Booking event payload
-│   └── PaymentEvent.java                               ← Payment event payload
+│   ├── PaymentEvent.java                               ← Payment event payload
+│   └── TrainRunEvent.java                              ← Train run event payload (triggers ES indexing)
+├── search/
+│   └── SearchDataProvider.java                         ← Interface: cross-module data access (Dependency Inversion)
 └── exception/
     ├── BusinessException.java                          ← Base exception
     ├── ResourceNotFoundException.java                  ← 404 errors
@@ -1384,10 +1624,23 @@ railway-train/src/main/java/com/railway/train/
 ├── service/TrainService.java                           ← Train CRUD
 ├── service/RouteService.java                           ← Route with stops CRUD
 ├── service/ScheduleService.java                        ← Schedule CRUD
+├── search/                                             ← [Phase 4] Elasticsearch search
+│   ├── document/JourneyOptionDocument.java             ← ES document model (denormalized journey)
+│   ├── document/CoachAvailability.java                 ← Nested: seats per coach type
+│   ├── document/FareInfo.java                          ← Nested: fare per coach type
+│   ├── repository/JourneyOptionSearchRepository.java   ← Spring Data ES repository
+│   ├── service/JourneyDocumentBuilder.java             ← Denormalization engine
+│   ├── service/TrainSearchService.java                 ← ES query builder + reindex
+│   └── kafka/SearchIndexingConsumer.java               ← Kafka → ES indexing pipeline
 ├── controller/StationController.java                   ← /api/v1/stations/*
 ├── controller/TrainController.java                     ← /api/v1/trains/*
 ├── controller/RouteController.java                     ← /api/v1/routes/*, /api/v1/admin/schedules
-└── dto/*.java                                          ← Request/Response DTOs
+├── controller/TrainSearchController.java               ← GET /api/v1/trains/search (public)
+├── controller/AdminSearchController.java               ← POST /api/v1/admin/search/reindex
+└── dto/*.java                                          ← Request/Response DTOs + JourneySearchResponse
+railway-train/src/main/resources/elasticsearch/
+├── journey-options-settings.json                       ← Edge ngram analyzer config
+└── journey-options-mappings.json                       ← Field mappings (keyword, nested, etc.)
 
 railway-booking/src/main/java/com/railway/booking/
 ├── entity/
@@ -1408,7 +1661,10 @@ railway-booking/src/main/java/com/railway/booking/
 │   └── IdempotencyStore.java                           ← Duplicate request prevention
 ├── kafka/
 │   ├── BookingEventPublisher.java                      ← Publishes booking lifecycle events
-│   └── PaymentEventConsumer.java                       ← Consumes payment events → confirms/fails bookings
+│   ├── PaymentEventConsumer.java                       ← Consumes payment events → confirms/fails bookings
+│   └── TrainRunEventPublisher.java                     ← Publishes TRAIN_RUN_CREATED → ES indexing
+├── search/
+│   └── SearchDataProviderImpl.java                     ← Implements SearchDataProvider (cross-module)
 ├── service/
 │   ├── BookingService.java                             ← THE ORCHESTRATOR: lock→book→cache→publish
 │   ├── SeatAvailabilityService.java                    ← Redis-first availability check
@@ -1453,10 +1709,10 @@ railway-app/src/main/java/com/railway/app/
     ├── SecurityConfig.java                             ← URL access rules, JWT filter
     ├── SwaggerConfig.java                              ← API documentation (Swagger UI)
     ├── RedisConfig.java                                ← Redis JSON serialization config
-    └── KafkaConfig.java                                ← Topic creation (6 topics)
+    └── KafkaConfig.java                                ← Topic creation (7 topics: booking, payment, notification, train + DLTs)
 
 railway-app/src/main/resources/
-├── application.yml                                     ← All configuration
+├── application.yml                                     ← All configuration (DB, JWT, Redis, Kafka, Elasticsearch)
 └── db/migration/
     ├── V1__create_users.sql                            ← Users table
     ├── V2__create_stations_trains.sql                  ← Stations + Trains tables
@@ -1471,10 +1727,10 @@ railway-app/src/main/resources/
 ## How to Run
 
 ```bash
-# 1. Start all infrastructure (PostgreSQL + Redis + Kafka + Zookeeper + Kafka UI)
+# 1. Start all infrastructure (PostgreSQL + Redis + Kafka + ZK + Kafka UI + Elasticsearch + Kibana)
 docker compose -f docker/docker-compose.yml up -d
 
-# 2. Verify all services are healthy
+# 2. Verify all services are healthy (should show 7 services)
 docker compose -f docker/docker-compose.yml ps
 
 # 3. Build the project
@@ -1489,9 +1745,16 @@ mvn spring-boot:run -pl railway-app
 # 6. Open Kafka UI — see topics and messages
 # http://localhost:8090
 
-# 7. Check Redis keys
+# 7. Open Kibana — inspect Elasticsearch indices and run queries
+# http://localhost:5601
+# Dev Tools → GET journey_options/_search  (see indexed journey documents)
+
+# 8. Check Elasticsearch cluster health
+# curl http://localhost:9200/_cluster/health?pretty
+
+# 9. Check Redis keys
 docker exec -it railway-redis redis-cli KEYS '*'
 
-# 8. Connect to PostgreSQL
+# 10. Connect to PostgreSQL
 docker exec -it railway-postgres psql -U railway railway_booking
 ```

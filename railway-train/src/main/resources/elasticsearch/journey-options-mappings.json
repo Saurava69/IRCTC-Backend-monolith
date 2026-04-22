@@ -1,0 +1,63 @@
+{
+  "properties": {
+    "id": { "type": "keyword" },
+    "trainRunId": { "type": "long" },
+    "trainId": { "type": "long" },
+    "trainNumber": { "type": "keyword" },
+    "trainName": {
+      "type": "text",
+      "analyzer": "autocomplete_analyzer",
+      "search_analyzer": "autocomplete_search_analyzer",
+      "fields": {
+        "keyword": { "type": "keyword" }
+      }
+    },
+    "trainType": { "type": "keyword" },
+    "runDate": { "type": "date", "format": "yyyy-MM-dd" },
+    "fromStationId": { "type": "long" },
+    "fromStationCode": { "type": "keyword" },
+    "fromStationName": {
+      "type": "text",
+      "analyzer": "autocomplete_analyzer",
+      "search_analyzer": "autocomplete_search_analyzer",
+      "fields": {
+        "keyword": { "type": "keyword" }
+      }
+    },
+    "toStationId": { "type": "long" },
+    "toStationCode": { "type": "keyword" },
+    "toStationName": {
+      "type": "text",
+      "analyzer": "autocomplete_analyzer",
+      "search_analyzer": "autocomplete_search_analyzer",
+      "fields": {
+        "keyword": { "type": "keyword" }
+      }
+    },
+    "departureTime": { "type": "keyword" },
+    "arrivalTime": { "type": "keyword" },
+    "durationMinutes": { "type": "integer" },
+    "distanceKm": { "type": "integer" },
+    "routeId": { "type": "long" },
+    "fromSequence": { "type": "integer" },
+    "toSequence": { "type": "integer" },
+    "coachAvailabilities": {
+      "type": "nested",
+      "properties": {
+        "coachType": { "type": "keyword" },
+        "totalSeats": { "type": "integer" },
+        "availableSeats": { "type": "integer" },
+        "racSeats": { "type": "integer" },
+        "waitlistCount": { "type": "integer" }
+      }
+    },
+    "fares": {
+      "type": "object",
+      "properties": {
+        "coachType": { "type": "keyword" },
+        "baseFare": { "type": "scaled_float", "scaling_factor": 100 }
+      }
+    },
+    "lastUpdated": { "type": "date" }
+  }
+}

@@ -18,6 +18,9 @@ public class KafkaConfig {
     @Value("${app.kafka.topics.notification-events}")
     private String notificationEventsTopic;
 
+    @Value("${app.kafka.topics.train-events}")
+    private String trainEventsTopic;
+
     @Bean
     public NewTopic bookingEventsTopic() {
         return TopicBuilder.name(bookingEventsTopic)
@@ -62,6 +65,14 @@ public class KafkaConfig {
     public NewTopic paymentEventsDltTopic() {
         return TopicBuilder.name(paymentEventsTopic + ".dlt")
                 .partitions(1)
+                .replicas(1)
+                .build();
+    }
+
+    @Bean
+    public NewTopic trainEventsTopic() {
+        return TopicBuilder.name(trainEventsTopic)
+                .partitions(3)
                 .replicas(1)
                 .build();
     }

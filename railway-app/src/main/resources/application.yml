@@ -36,6 +36,9 @@ spring:
       port: 6379
       timeout: 2000ms
 
+  elasticsearch:
+    uris: http://localhost:9200
+
   kafka:
     bootstrap-servers: localhost:9092
     producer:
@@ -81,6 +84,7 @@ app:
       booking-events: booking.events
       payment-events: payment.events
       notification-events: notification.events
+      train-events: train.events
 
 springdoc:
   swagger-ui:

@@ -29,9 +29,13 @@
 20. [Lombok](#20-lombok)
 21. [Apache Kafka & Event-Driven Architecture](#21-apache-kafka--event-driven-architecture)
 22. [Payment Processing Patterns](#22-payment-processing-patterns)
-23. [Real Bugs We Hit & Fixed (Phase 1-3)](#23-real-bugs-we-hit--fixed-phase-1-3)
-24. [What's Coming — Elasticsearch, CQRS, Waitlist](#24-whats-coming--elasticsearch-cqrs-waitlist)
-25. [Learning Resources](#25-learning-resources)
+23. [Elasticsearch & Full-Text Search](#23-elasticsearch--full-text-search)
+24. [CQRS — Command Query Responsibility Segregation](#24-cqrs--command-query-responsibility-segregation)
+25. [Document Modeling & Denormalization](#25-document-modeling--denormalization)
+26. [Dependency Inversion in a Modular Monolith](#26-dependency-inversion-in-a-modular-monolith)
+27. [Real Bugs We Hit & Fixed (Phase 1-3)](#27-real-bugs-we-hit--fixed-phase-1-3)
+28. [What's Coming — Waitlist, Cancellations, Testing](#28-whats-coming--waitlist-cancellations-testing)
+29. [Learning Resources](#29-learning-resources)
 
 ---
 
@@ -1651,7 +1655,377 @@ POST /api/v1/payments/{paymentId}/retry
 
 ---
 
-## 23. Real Bugs We Hit & Fixed (Phase 1-3)
+## 23. Elasticsearch & Full-Text Search
+
+### What is Elasticsearch?
+
+Elasticsearch is a distributed search engine built on Apache Lucene. It stores data as **JSON documents** (not rows) and indexes every field for instant retrieval. Think of it as a search-optimized database:
+
+- **Inverted index** — Instead of "document → words", ES stores "word → documents". Looking up "Delhi" instantly returns all documents containing "Delhi" without scanning every record.
+- **Full-text search** — Fuzzy matching, relevance scoring, stemming ("running" matches "run")
+- **Autocomplete** — Edge ngram tokenization turns "New Delhi" into ["Ne", "New", "New ", "New D", ...] for prefix matching
+- **Nested objects** — Unlike relational databases, ES can search inside nested arrays (e.g., "find journeys where SLEEPER coach has > 10 available seats")
+
+### Why Not Just Use PostgreSQL for Search?
+
+| Concern | PostgreSQL | Elasticsearch |
+|---------|-----------|---------------|
+| Full-text search | `LIKE '%delhi%'` — slow, no relevance | Purpose-built with BM25 scoring |
+| Autocomplete | ILIKE + index — works but limited | Edge ngram analyzer — instant prefix match |
+| Faceted search | Multiple JOINs across tables | Single denormalized document — no JOINs |
+| Scaling reads | Single node, connection pool limited | Distributed, add nodes for more read capacity |
+| Data model | Normalized (many tables, JOINs) | Denormalized (one document has everything) |
+
+PostgreSQL is the **source of truth** for writes. Elasticsearch is the **read-optimized view** for search. This separation is the CQRS pattern (Section 24).
+
+### Key Elasticsearch Concepts
+
+| Concept | Relational Equivalent | Our Usage |
+|---------|----------------------|-----------|
+| **Index** | Database table | `journey_options` — all searchable journey combinations |
+| **Document** | Row | One journey option: train 12301, Delhi→Mumbai, April 25 |
+| **Field** | Column | trainNumber, fromStationName, runDate, etc. |
+| **Mapping** | Schema/DDL | Defines field types, analyzers, nested objects |
+| **Analyzer** | — (no equivalent) | Text processing pipeline: tokenize → lowercase → ngram |
+| **Nested type** | JOIN table | coachAvailabilities array — searchable independently |
+
+### Edge Ngram Analyzer — How Autocomplete Works
+
+When a user types "Ne" in the station search box, we want to instantly suggest "New Delhi", "New Jalpaiguri", "Nellore". Here's how:
+
+```json
+// Index settings (journey-options-settings.json)
+{
+  "analysis": {
+    "tokenizer": {
+      "autocomplete_tokenizer": {
+        "type": "edge_ngram",
+        "min_gram": 2,
+        "max_gram": 20,
+        "token_chars": ["letter", "digit", "whitespace"]
+      }
+    },
+    "analyzer": {
+      "autocomplete_analyzer": {
+        "tokenizer": "autocomplete_tokenizer",
+        "filter": ["lowercase"]
+      }
+    }
+  }
+}
+```
+
+**At index time**, "New Delhi" is tokenized into: `["ne", "new", "new ", "new d", "new de", "new del", "new delh", "new delhi"]`
+
+**At search time**, the user's query "ne" uses the standard tokenizer (just `["ne"]`). ES finds all documents where the indexed ngrams include "ne" — instant match.
+
+**Why two analyzers?** If we used edge_ngram at search time too, searching "new delhi" would become ["ne", "new", "new ", ...] and match way too broadly. The search analyzer uses standard tokenization for precision.
+
+### Nested Types — Searching Inside Arrays
+
+Our `JourneyOptionDocument` has a list of `coachAvailabilities`:
+
+```json
+{
+  "trainNumber": "12301",
+  "coachAvailabilities": [
+    { "coachType": "FIRST_AC", "availableSeats": 12 },
+    { "coachType": "SLEEPER", "availableSeats": 0 }
+  ]
+}
+```
+
+**Without `nested` mapping**, ES flattens the array. A query for "coachType=SLEEPER AND availableSeats>0" would match this document because it sees SLEEPER (from one object) and 12 available seats (from a different object). This is called **cross-object matching** and gives wrong results.
+
+**With `nested` mapping**, each array element is stored as an independent sub-document. The query correctly evaluates each coach separately and does NOT match this document (SLEEPER has 0 seats).
+
+```json
+// In mappings:
+"coachAvailabilities": {
+  "type": "nested",        // ← This is the key
+  "properties": {
+    "coachType": { "type": "keyword" },
+    "availableSeats": { "type": "integer" }
+  }
+}
+```
+
+### Our Index: `journey_options`
+
+**Document ID pattern:** `{trainRunId}_{fromStationId}_{toStationId}`
+
+This means for a train with 4 stops (Delhi → Jaipur → Ahmedabad → Mumbai), we create C(4,2) = 6 documents:
+- Delhi→Jaipur, Delhi→Ahmedabad, Delhi→Mumbai
+- Jaipur→Ahmedabad, Jaipur→Mumbai
+- Ahmedabad→Mumbai
+
+Each document is self-contained — it has the train name, station names, timings, availability per coach type, and fares. No JOINs at query time.
+
+### Learn More
+- [Elasticsearch: The Definitive Guide (free)](https://www.elastic.co/guide/en/elasticsearch/guide/current/index.html)
+- [Elasticsearch Official Docs](https://www.elastic.co/guide/en/elasticsearch/reference/8.13/index.html)
+- [Spring Data Elasticsearch Reference](https://docs.spring.io/spring-data/elasticsearch/reference/)
+- [Baeldung — Spring Data Elasticsearch](https://www.baeldung.com/spring-data-elasticsearch-tutorial)
+
+---
+
+## 24. CQRS — Command Query Responsibility Segregation
+
+### What is CQRS?
+
+CQRS separates your system into two paths:
+
+```
+┌─── COMMAND (Write) Path ─────────────────────────────┐
+│  POST /bookings → BookingService → PostgreSQL         │
+│  POST /admin/trains → TrainService → PostgreSQL       │
+│                                                       │
+│  Source of truth. ACID transactions. Normalized data. │
+└───────────────────────────┬───────────────────────────┘
+                            │ Kafka events
+┌───────────────────────────▼───────────────────────────┐
+│  EVENT BUS (Kafka)                                    │
+│  train.events:   TRAIN_RUN_CREATED                    │
+│  booking.events: BOOKING_CONFIRMED / BOOKING_FAILED   │
+└───────────────────────────┬───────────────────────────┘
+                            │
+┌───────────────────────────▼───────────────────────────┐
+│  QUERY (Read) Path                                    │
+│  SearchIndexingConsumer → JourneyDocumentBuilder       │
+│           → Elasticsearch (denormalized documents)     │
+│  GET /trains/search → TrainSearchService → ES          │
+│                                                       │
+│  Optimized for reads. Denormalized. Eventually consistent. │
+└───────────────────────────────────────────────────────┘
+```
+
+### Why CQRS?
+
+**Without CQRS (single model):**
+- "Search trains from Delhi to Mumbai on April 25" requires JOINing trains, routes, route_stations, schedules, train_runs, seat_inventory, stations — 7 tables
+- Each search query hits the same PostgreSQL instance that's handling bookings
+- Under load, searches slow down bookings and vice versa
+
+**With CQRS:**
+- The write path (bookings) talks to PostgreSQL — ACID transactions, strong consistency
+- The read path (search) talks to Elasticsearch — pre-computed, denormalized, blazing fast
+- They're completely independent — heavy search traffic doesn't affect booking throughput
+
+### Eventual Consistency — The Trade-off
+
+CQRS introduces **eventual consistency**: when an admin generates train runs, there's a brief delay (~1-2 seconds) before the search results update. The sequence is:
+
+```
+1. Admin generates train runs → PostgreSQL updated immediately
+2. TrainRunEventPublisher publishes TRAIN_RUN_CREATED to Kafka
+3. SearchIndexingConsumer receives the event
+4. JourneyDocumentBuilder queries PostgreSQL for full data
+5. Documents indexed into Elasticsearch
+```
+
+Between steps 1 and 5 (~1-2 seconds), a search won't find the new train run. This is acceptable for search but would NOT be acceptable for, say, checking if a payment went through.
+
+**Rule of thumb**: Use eventual consistency for **read-optimized views** (search, analytics, dashboards). Use strong consistency for **critical business operations** (payments, inventory).
+
+### The Reindex Safety Net
+
+What if Elasticsearch gets out of sync? Network glitch, ES restart, Kafka consumer lag? We provide a manual reindex endpoint:
+
+```
+POST /api/v1/admin/search/reindex
+```
+
+This queries ALL active train runs from PostgreSQL, builds all journey documents, and bulk-indexes them into ES. It's the "catch-up" mechanism — idempotent and safe to run anytime.
+
+**In production, you'd also want:**
+- Scheduled reindex jobs (nightly)
+- A reconciliation job that compares PG counts vs ES counts
+- Alerting on consumer lag (if ES falls too far behind)
+
+### Learn More
+- [Martin Fowler — CQRS](https://martinfowler.com/bliki/CQRS.html)
+- [Microsoft — CQRS Pattern](https://learn.microsoft.com/en-us/azure/architecture/patterns/cqrs)
+- [Designing Data-Intensive Applications — Ch. 11, 12](https://dataintensive.net/) (Stream Processing, The Future of Data Systems)
+- [Greg Young — CQRS and Event Sourcing](https://cqrs.files.wordpress.com/2010/11/cqrs_documents.pdf) (the original paper)
+
+---
+
+## 25. Document Modeling & Denormalization
+
+### The JourneyOptionDocument — Why It Looks the Way It Does
+
+In PostgreSQL, train search data is spread across 7 tables. In Elasticsearch, it's one flat document:
+
+```java
+@Document(indexName = "journey_options")
+public class JourneyOptionDocument {
+    String id;                    // "42_1_3" (trainRunId_fromStationId_toStationId)
+
+    // Train info (from trains table)
+    String trainNumber, trainName, trainType;
+
+    // Journey info (from route_stations table)
+    LocalDate runDate;
+    String fromStationCode, fromStationName;
+    String toStationCode, toStationName;
+    LocalTime departureTime, arrivalTime;
+    Integer durationMinutes, distanceKm;
+
+    // Availability (from seat_inventory table)
+    List<CoachAvailability> coachAvailabilities;  // nested
+
+    // Pricing (computed)
+    List<FareInfo> fares;
+}
+```
+
+**This is denormalization** — we've duplicated data from multiple PostgreSQL tables into a single document. The same train name appears in every journey document for that train.
+
+### Why Denormalize?
+
+| Concern | Normalized (PostgreSQL) | Denormalized (Elasticsearch) |
+|---------|------------------------|------------------------------|
+| Storage | Efficient — train name stored once | Wasteful — duplicated in every document |
+| Writes | Fast — update train name in one place | Slow — must update every document with that train |
+| Reads | Slow — JOIN 7 tables per query | Fast — everything in one document, zero JOINs |
+| Consistency | Instant — one source of truth | Eventual — Kafka propagation delay |
+
+**The trade-off is intentional**: reads happen 1000x more often than writes in a search system. We sacrifice write efficiency and storage for dramatically faster reads.
+
+### The Document Builder — The Denormalization Engine
+
+`JourneyDocumentBuilder.java` is where normalization dies and denormalization is born. For each train run, it:
+
+1. **Loads TrainRun** — via `SearchDataProvider` (booking module provides this through DI)
+2. **Loads Route + RouteStations** — with station details (train module)
+3. **Loads Train** — name, number, type (train module)
+4. **Loads SeatInventory** — per-segment availability (booking module via `SearchDataProvider`)
+5. **Generates all station pairs** — for N stations, produces N*(N-1)/2 documents
+6. **Calculates derived fields** — duration from departure/arrival times + dayOffset, distance from distanceFromOriginKm
+
+```
+Route: Delhi(seq=1) → Jaipur(seq=2) → Ahmedabad(seq=3) → Mumbai(seq=4)
+
+Documents generated:
+  1_2: Delhi→Jaipur       (dep: 06:00, arr: 10:30, 4h30m, 270km)
+  1_3: Delhi→Ahmedabad    (dep: 06:00, arr: 16:00, 10h00m, 670km)
+  1_4: Delhi→Mumbai        (dep: 06:00, arr: 22:30, 16h30m, 1380km)
+  2_3: Jaipur→Ahmedabad   (dep: 10:35, arr: 16:00, 5h25m, 400km)
+  2_4: Jaipur→Mumbai       (dep: 10:35, arr: 22:30, 11h55m, 1110km)
+  3_4: Ahmedabad→Mumbai   (dep: 16:10, arr: 22:30, 6h20m, 710km)
+```
+
+### Availability Updates — Keeping ES in Sync
+
+When a booking is confirmed or fails, seat availability changes. The `SearchIndexingConsumer` listens to `booking.events` and updates the affected documents:
+
+```
+BOOKING_CONFIRMED for trainRunId=42:
+  1. Load existing ES documents for trainRunId=42
+  2. Re-query seat_inventory from PostgreSQL (fresh data)
+  3. Update coachAvailabilities in each document
+  4. Save back to Elasticsearch
+```
+
+This is cheaper than rebuilding all documents from scratch — we only update the availability fields, not the train name, timings, etc.
+
+### Learn More
+- [Elasticsearch — Modeling Your Data](https://www.elastic.co/guide/en/elasticsearch/guide/current/modeling-your-data.html)
+- [MongoDB — Data Modeling (concepts apply to ES)](https://www.mongodb.com/docs/manual/core/data-modeling-introduction/)
+- [Designing Data-Intensive Applications — Ch. 2](https://dataintensive.net/) (Data Models and Query Languages)
+
+---
+
+## 26. Dependency Inversion in a Modular Monolith
+
+### The Problem: Cross-Module Data Access
+
+The Elasticsearch indexing pipeline (in `railway-train`) needs data from both modules:
+- **Train data**: train name, route, stations — lives in `railway-train`
+- **Booking data**: train runs, seat inventory — lives in `railway-booking`
+
+But `railway-train` cannot depend on `railway-booking` (that would create a circular dependency or violate our module boundary rule).
+
+### The Solution: Dependency Inversion Principle (DIP)
+
+Instead of the train module depending on the booking module, we:
+
+1. **Define an interface in `railway-common`** (which both modules already depend on):
+
+```java
+// railway-common — the abstraction
+public interface SearchDataProvider {
+    record TrainRunInfo(Long id, Long trainId, Long routeId, ...) {}
+    record SegmentAvailability(String coachType, int availableSeats, ...) {}
+
+    TrainRunInfo getTrainRunInfo(Long trainRunId);
+    List<SegmentAvailability> getSegmentAvailabilities(Long trainRunId);
+    List<Long> getAllActiveTrainRunIds();
+}
+```
+
+2. **Implement it in `railway-booking`** (which has access to `TrainRunRepository` and `SeatInventoryRepository`):
+
+```java
+// railway-booking — the concrete implementation
+@Service
+public class SearchDataProviderImpl implements SearchDataProvider {
+    private final TrainRunRepository trainRunRepository;
+    private final SeatInventoryRepository seatInventoryRepository;
+    // ... delegates to existing repositories
+}
+```
+
+3. **Inject the interface in `railway-train`** (Spring autowires the implementation at runtime):
+
+```java
+// railway-train — depends only on the interface, not the implementation
+@Service
+public class JourneyDocumentBuilder {
+    private final SearchDataProvider searchDataProvider;  // Spring injects SearchDataProviderImpl
+    private final RouteRepository routeRepository;        // Own module's repository
+    // ...
+}
+```
+
+### Why This Works
+
+```
+COMPILE TIME:
+  railway-train → depends on → railway-common (SearchDataProvider interface)
+  railway-booking → depends on → railway-common (SearchDataProvider interface)
+  railway-train does NOT depend on railway-booking ✓
+
+RUNTIME (Spring context):
+  railway-app loads all modules → Spring finds SearchDataProviderImpl
+  → Injects it into JourneyDocumentBuilder
+  → Everything works, no circular dependencies
+```
+
+This is the **Dependency Inversion Principle** — the "D" in SOLID:
+- High-level modules (train search) depend on abstractions (the interface)
+- Low-level modules (booking data access) implement the abstraction
+- Neither depends on the other directly
+
+**This same pattern is what you'd use when extracting to microservices.** The interface becomes an API contract. The implementation becomes a REST client. The calling code doesn't change.
+
+### Alternatives We Considered
+
+| Approach | Why We Didn't Choose It |
+|----------|------------------------|
+| `railway-train` depends on `railway-booking` | Violates module boundary rule. Creates coupling. |
+| Put everything in `railway-app` | Makes app module a "god module" with all business logic |
+| Use `EntityManager` native queries in train module | Works but bypasses JPA entities, no type safety, harder to maintain |
+| Kafka events carry full data (fat events) | Events become huge, tightly coupled to schema changes |
+
+### Learn More
+- [Robert C. Martin — Dependency Inversion Principle](https://web.archive.org/web/2021/https://blog.cleancoder.com/uncle-bob/2016/01/04/ALittleArchitecture.html)
+- [Martin Fowler — Inversion of Control](https://martinfowler.com/bliki/InversionOfControl.html)
+- [Clean Architecture — Ch. 11](https://www.oreilly.com/library/view/clean-architecture/9780134494272/) (The Dependency Rule)
+
+---
+
+## 27. Real Bugs We Hit & Fixed (Phase 1-3)
 
 These are actual bugs encountered during development. Each one teaches a distributed systems or JPA lesson you won't find in tutorials.
 
@@ -1751,21 +2125,9 @@ public ResponseEntity<ErrorResponse> handleGeneral(Exception ex) {
 
 ---
 
-## 24. What's Coming — Elasticsearch, CQRS, Waitlist
+## 28. What's Coming — Waitlist, Cancellations, Testing
 
-### Phase 4: Elasticsearch (CQRS)
-
-**CQRS** = Command Query Responsibility Segregation.
-
-```
-WRITES go to PostgreSQL (the source of truth)
-    ↓ Kafka event
-READS come from Elasticsearch (optimized for search)
-```
-
-**Why**: PostgreSQL is great for transactions but slow for full-text search across millions of trains. Elasticsearch is purpose-built for search — fuzzy matching, autocomplete, relevance scoring.
-
-### Phase 5: Waitlist/RAC + Notifications
+### Phase 5: Waitlist/RAC + Cancellations + Notifications
 
 Event-driven choreography: one cancellation triggers a chain of events — refund processing, waitlist promotion, notification sending — all asynchronous, all decoupled.
 
@@ -1775,7 +2137,7 @@ Testcontainers (integration tests with real Docker containers), circuit breakers
 
 ---
 
-## 25. Learning Resources
+## 29. Learning Resources
 
 ### Books (Highly Recommended)
 
